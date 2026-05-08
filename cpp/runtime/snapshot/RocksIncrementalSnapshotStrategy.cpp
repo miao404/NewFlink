@@ -43,13 +43,14 @@ RocksIncrementalSnapshotStrategy::RocksIncrementalSnapshotStrategy(
     stateUploader_(rocksDBStateUploader) {}
 
 std::shared_ptr<SnapshotResultSupplier<KeyedStateHandle>> RocksIncrementalSnapshotStrategy::asyncSnapshot(
-    SnapshotResources* snapshotResources,
+    const std::shared_ptr<SnapshotResources>& snapshotResources,
     long checkpointId,
     long timestamp,
     CheckpointStreamFactory* checkpointStreamFactory,
-    CheckpointOptions* checkpointOptions)
+    CheckpointOptions* checkpointOptions,
+    std::string keySerializer)
 {
-    auto rocksdbSnapshotResources = static_cast<NativeRocksDBSnapshotResources*>(snapshotResources);
+    auto rocksdbSnapshotResources = static_cast<NativeRocksDBSnapshotResources*>(snapshotResources.get());
 
     if (rocksdbSnapshotResources->stateMetaInfoSnapshots.empty()) {
         return std::make_shared<SnapshotResultSupplierEmpty>();
@@ -78,7 +79,9 @@ std::shared_ptr<SnapshotResultSupplier<KeyedStateHandle>> RocksIncrementalSnapsh
             snapshotDirectory,
             previousSnapshot,
             sharingStrategy,
-            stateMetaInfoSnapshots);
+            stateMetaInfoSnapshots,
+            checkpointOptions,
+            keySerializer_);
 }
 
 void RocksIncrementalSnapshotStrategy::notifyCheckpointComplete(long completedCheckpointId)
@@ -137,17 +140,21 @@ RocksIncrementalSnapshotStrategy::RocksDBIncrementalSnapshotOperation::RocksDBIn
     std::shared_ptr<SnapshotDirectory> localBackupDirectory,
     std::shared_ptr<PreviousSnapshot> previousSnapshot,
     SnapshotType::SharingFilesStrategy sharingFilesStrategy,
-    std::vector<std::shared_ptr<StateMetaInfoSnapshot>>& stateMetaInfoSnapshots)
+    std::vector<std::shared_ptr<StateMetaInfoSnapshot>>& stateMetaInfoSnapshots,
+    CheckpointOptions *checkpointOptions,
+    std::shared_ptr<TypeSerializer> keySerializer)
     : RocksDBSnapshotOperation(
     checkpointId,
     checkpointStreamFactory,
     localBackupDirectory,
-    stateMetaInfoSnapshots),
+    stateMetaInfoSnapshots,
+    keySerializer),
     parent_(parent),
     previousSnapshot_(previousSnapshot),
-    sharingFilesStrategy_(sharingFilesStrategy) {}
+    sharingFilesStrategy_(sharingFilesStrategy),
+    checkpointOptions_(checkpointOptions) {}
 
-SnapshotResult<KeyedStateHandle> *RocksIncrementalSnapshotStrategy::RocksDBIncrementalSnapshotOperation::get(
+std::shared_ptr<SnapshotResult<KeyedStateHandle>> RocksIncrementalSnapshotStrategy::RocksDBIncrementalSnapshotOperation::get(
     std::shared_ptr<omnistream::OmniTaskBridge> bridge)
 {
     bool completed = false;
@@ -160,7 +167,9 @@ SnapshotResult<KeyedStateHandle> *RocksIncrementalSnapshotStrategy::RocksDBIncre
         metaStateHandle = parent_->materializeMetaData(
             stateMetaInfoSnapshots,
             checkpointId,
-            bridge);
+            checkpointOptions_,
+            bridge,
+            keySerializer->toJson());
 
         // 2. 上传文件
         long uploadedSize = uploadSnapshotFiles(
@@ -185,13 +194,13 @@ SnapshotResult<KeyedStateHandle> *RocksIncrementalSnapshotStrategy::RocksDBIncre
             sstFiles);
 
         // 5. 返回最终结果
-        SnapshotResult<KeyedStateHandle> *result;
+        std::shared_ptr<SnapshotResult<KeyedStateHandle>> result;
         if (localSnapshot) {
             result = (jmHandle != nullptr) ?
-                new SnapshotResult<KeyedStateHandle>(jmHandle, localSnapshot)
-                : new SnapshotResult<KeyedStateHandle>(nullptr, nullptr);
+                std::make_shared<SnapshotResult<KeyedStateHandle>>(jmHandle, localSnapshot)
+                : std::make_shared<SnapshotResult<KeyedStateHandle>>(nullptr, nullptr);
         } else {
-            result = new SnapshotResult<KeyedStateHandle>(jmHandle, nullptr);
+            result = std::make_shared<SnapshotResult<KeyedStateHandle>>(jmHandle, nullptr);
         }
 
         completed = true;

@@ -19,7 +19,7 @@
 
 #define likely(x)      __builtin_expect(!!(x), 1)
 #define unlikely(x)    __builtin_expect(!!(x), 0)
-
+class Class;
 class Object {
 public:
     Object();
@@ -44,9 +44,11 @@ public:
 
     Object &operator=(Object &&obj);
 
-    void putRefCount();
+    virtual void putRefCount();
 
-    void getRefCount();
+    inline void getRefCount() {
+        ++refCount;
+    }
 
     void setRefCount(uint64_t count);
 
@@ -55,6 +57,11 @@ public:
     uint64_t getRefCountNumber();
 
     virtual void setValue(const std::string& value);
+
+    virtual Class* getObjectClass();
+
+    static Class *getClass();
+
 public:
     std::recursive_mutex mutex;
     bool isClone = false;

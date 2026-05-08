@@ -23,6 +23,7 @@ import org.apache.flink.api.common.typeutils.TypeSerializer;
 import org.apache.flink.api.common.typeutils.base.ListSerializer;
 import org.apache.flink.api.common.typeutils.base.MapSerializer;
 import org.apache.flink.api.connector.sink2.Sink;
+import org.apache.flink.api.connector.source.Source;
 import org.apache.flink.api.java.typeutils.runtime.PojoSerializer;
 import org.apache.flink.api.java.typeutils.runtime.TupleSerializer;
 import org.apache.flink.runtime.jobgraph.JobVertex;
@@ -36,7 +37,9 @@ import org.apache.flink.streaming.api.graph.StreamEdge;
 import org.apache.flink.streaming.api.graph.StreamGraph;
 import org.apache.flink.streaming.api.graph.StreamNode;
 import org.apache.flink.streaming.api.graph.StreamingJobGraphGenerator;
+import org.apache.flink.streaming.api.operators.SimpleInputFormatOperatorFactory;
 import org.apache.flink.streaming.api.operators.SimpleOperatorFactory;
+import org.apache.flink.streaming.api.operators.SourceOperatorFactory;
 import org.apache.flink.streaming.api.operators.StreamOperator;
 import org.apache.flink.streaming.api.operators.StreamOperatorFactory;
 import org.apache.flink.streaming.runtime.operators.sink.SinkWriterOperatorFactory;
@@ -90,11 +93,10 @@ public final class OmniGraphOverride {
             "ProcessOperator"));
 
     private static final Set<String> SUPPORT_STREAM_TRANSFER_SERIALIZER = new HashSet<>(Arrays.asList(
-        "StringSerializer",
-        "DoubleSerializer",
-        "LongSerializer",
-        "BigIntSerializer",
-        "IntSerializer"));
+            "StringSerializer",
+            "DoubleSerializer",
+            "LongSerializer",
+            "BigIntSerializer"));
 
 
     private static JobType jobType = JobType.NULL;
@@ -107,14 +109,21 @@ public final class OmniGraphOverride {
     private static final Set<String> SUPPORT_OP_NAME = new HashSet<>();
     private static final Set<String> OP_NAME_OF_SQL = new HashSet<>();
     private static final Set<String> VALID_PARTITION_NAMES = new HashSet<>(
-        Arrays.asList("ForwardPartitioner", "KeyGroupStreamPartitioner", "RescalePartitioner", "RebalancePartitioner",
-            "GlobalPartitioner"));
+            Arrays.asList("ForwardPartitioner", "KeyGroupStreamPartitioner", "RescalePartitioner", "RebalancePartitioner",
+                    "GlobalPartitioner"));
+    private static final Set<String> WINDOW_OP_NAMES = new HashSet<>(Arrays.asList(
+            "WindowAggregate",
+            "WindowJoin",
+            "GroupWindowAggregate",
+            "GlobalWindowAggregate",
+            "LocalWindowAggregate"));
+
     private static final String WRITER_NAME = "Writer";
     private static final String SINK_NAME = "Sink:";
 
     private static final String[] WATERMARK = {"watermarks", "timestamps"};
     private static final String SINK_REGEX_PATTERN = ".*"
-        + Pattern.quote(WRITER_NAME) + "\\s*$" + "|^" + SINK_NAME + ".*";
+            + Pattern.quote(WRITER_NAME) + "\\s*$" + "|^" + SINK_NAME + ".*";
     private static final Pattern SINK_REGEX = Pattern.compile(SINK_REGEX_PATTERN);
 
     private static final Set<String> SUPPORT_KAFKA_SCHEMA_TYPE = new HashSet<>();
@@ -139,9 +148,7 @@ public final class OmniGraphOverride {
                     "LookupJoin",
                     "WatermarkAssigner",
                     "StreamRecordTimestampInserter",
-                    "ConstraintEnforcer",
-                    "GroupAggregate",
-                    "Deduplicate"));
+                    "ConstraintEnforcer"));
         } else {
             SUPPORT_OP_NAME.addAll(Arrays.asList(
                     "Calc",
@@ -216,15 +223,15 @@ public final class OmniGraphOverride {
             SUPPORT_OP_NAME.clear();
             SUPPORT_OP_NAME.addAll(
                     Arrays.asList("Calc", "WatermarkAssigner", "StreamRecordTimestampInserter",
-                            "ConstraintEnforcer", "GroupAggregate"));
+                            "ConstraintEnforcer"));
         }
     }
 
     /**
      * validateVertexForOmniTask
      *
-     * @param vertexEntry vertexEntry
-     * @param chainInfos chainInfos
+     * @param vertexEntry   vertexEntry
+     * @param chainInfos    chainInfos
      * @param vertexConfigs vertexConfigs
      * @return validate result
      */
@@ -232,16 +239,25 @@ public final class OmniGraphOverride {
                                                     Map<Integer, StreamingJobGraphGenerator.OperatorChainInfo> chainInfos,
                                                     Map<Integer, Map<Integer, StreamConfig>> chainedConfigs,
                                                     Map<Integer, StreamConfig> vertexConfigs,
-                                                    JobType jobType) {
+                                                    JobType jobType,
+                                                    boolean checkpointingEnabled) {
 
         StreamConfig vertexConfig = new StreamConfig(vertexEntry.getValue().getConfiguration());
         Integer vertexID = vertexEntry.getKey();
         LOG.info("validateVertexForOmniTask : vertexID is {}, and vertexName {}",
-            vertexID, vertexConfig.getOperatorName());
+                vertexID, vertexConfig.getOperatorName());
 
         JobVertex jobVertex = vertexEntry.getValue();
 
-        if (validateVertexChainInfoForOmniTask(vertexID, chainInfos, chainedConfigs, jobVertex, vertexConfigs, jobType)) {
+        if (validateVertexChainInfoForOmniTask(vertexID, chainInfos, chainedConfigs, jobVertex, vertexConfigs,
+                jobType, checkpointingEnabled)) {
+            if (checkpointingEnabled && (vertexConfig.getOperatorName().contains("Source")
+                    || vertexConfig.getOperatorName().contains("Sink")
+                    || vertexConfig.getOperatorName().contains("Map"))) {
+                LOG.info("validateVertexForOmniTask  false for : vertexID is {}, and vertexName {}", vertexID, vertexConfig.getOperatorName());
+                vertexConfig.setUseOmniEnabled(false);
+                return false;
+            }
             LOG.info("validateVertexForOmniTask  true for : vertexID is {}, and vertexName {}", vertexID, vertexConfig.getOperatorName());
             vertexConfig.setUseOmniEnabled(true);
             return true;
@@ -273,7 +289,7 @@ public final class OmniGraphOverride {
             TypeSerializer<?> keySerializer = ((MapSerializer<?, ?>) typeSerializer).getKeySerializer();
             TypeSerializer<?> valueSerializer = ((MapSerializer<?, ?>) typeSerializer).getValueSerializer();
             return checkDataStreamSupportTransferSerializer(keySerializer)
-                && checkDataStreamSupportTransferSerializer(valueSerializer);
+                    && checkDataStreamSupportTransferSerializer(valueSerializer);
         }
         if (typeSerializer instanceof PojoSerializer) {
             TypeSerializer<Object>[] fieldSerializers = ReflectionUtils.retrievePrivateField(typeSerializer, "fieldSerializers");
@@ -286,13 +302,14 @@ public final class OmniGraphOverride {
         }
         return SUPPORT_STREAM_TRANSFER_SERIALIZER.contains(typeSerializer.getClass().getSimpleName())
                 || typeSerializer.getClass().getName().contains(
-                        "org.apache.flink.streaming.api.connector.sink2.CommittableMessageTypeInfo");
+                "org.apache.flink.streaming.api.connector.sink2.CommittableMessageTypeInfo");
     }
 
     private static boolean validateVertexChainInfoForOmniTask(Integer vertexID,
-        Map<Integer, StreamingJobGraphGenerator.OperatorChainInfo> chainInfos,
-        Map<Integer, Map<Integer, StreamConfig>> chainedConfigs, JobVertex jobVertex,
-        Map<Integer, StreamConfig> vertexConfigs, JobType jobType) {
+                                                              Map<Integer, StreamingJobGraphGenerator.OperatorChainInfo> chainInfos,
+                                                              Map<Integer, Map<Integer, StreamConfig>> chainedConfigs, JobVertex jobVertex,
+                                                              Map<Integer, StreamConfig> vertexConfigs, JobType jobType,
+                                                              boolean checkpointingEnabled) {
         // walkthrough each operator
         StreamingJobGraphGenerator.OperatorChainInfo chainInfo = chainInfos.get(vertexID);
         if (chainInfo == null) {
@@ -303,7 +320,22 @@ public final class OmniGraphOverride {
         StreamGraph streamGraph = chainInfo.getStreamGraph();
         List<StreamNode> chainedNode = chainInfo.getAllChainedNodes();
         for (StreamNode node : chainedNode) {
-            if (validateNodeForOmniTask(vertexID, vertexConfigs, jobType, streamGraph, node)) {
+            if (validateNodeForOmniTask(vertexID, vertexConfigs, jobType, streamGraph, node, checkpointingEnabled)) {
+                return false;
+            }
+        }
+
+        StreamNode lastNode = chainedNode.get(0);
+        StreamNode firstNode = chainedNode.get(chainedNode.size() - 1);
+
+        if (checkpointingEnabled
+                && jobType == JobType.STREAM
+                && "Map".equals(lastNode.getOperatorName())
+                && firstNode.getOperatorFactory() instanceof SourceOperatorFactory) {
+            SourceOperatorFactory<?> sourceOperatorFactory = (SourceOperatorFactory<?>) firstNode.getOperatorFactory();
+            Source source = ReflectionUtils.retrievePrivateField(sourceOperatorFactory, "source");
+            if ("KafkaSource".equals(source.getClass().getSimpleName())) {
+                LOG.info("unsupported operators kafkaSource and map for this job in native, roll back.");
                 return false;
             }
         }
@@ -325,7 +357,7 @@ public final class OmniGraphOverride {
                 vertexConfigs.get(Id).setOperatorType(operatorType.getValue());
             }
         }
-        
+
         if (jobType.equals(JobType.STREAM) || jobType.equals(JobType.SQL)) {
             StreamConfig config = vertexConfigs.get(vertexID); // the StreamConfig of the first operator in the operatorChain/task.
             config.setTransitiveChainedTaskConfigsOptimized(chainedConfigs.get(vertexID));
@@ -344,9 +376,9 @@ public final class OmniGraphOverride {
 
         TypeSerializer<?> stateKeySerializer = firstNode.getStateKeySerializer();
 
-        if(stateKeySerializer != null && !checkDataStreamSupportTransferSerializer(stateKeySerializer)) {
+        if (stateKeySerializer != null && !checkDataStreamSupportTransferSerializer(stateKeySerializer)) {
             LOG.info("unsupported serializer for State Key " +
-                "in typeSerializersIn of {}", firstNode.getOperatorName());
+                    "in typeSerializersIn of {}", firstNode.getOperatorName());
             return true;
         }
 
@@ -356,21 +388,22 @@ public final class OmniGraphOverride {
             for (TypeSerializer<?> typeSerializer : typeSerializersIn) {
                 if (!checkDataStreamSupportTransferSerializer(typeSerializer)) {
                     LOG.info("unsupported serializer for DataStream transmission " +
-                        "in typeSerializersIn of {}", firstNode.getOperatorName());
+                            "in typeSerializersIn of {}", firstNode.getOperatorName());
                     return true;
                 }
             }
         }
         if (typeSerializerOut != null && !checkDataStreamSupportTransferSerializer(typeSerializerOut)) {
             LOG.info("unsupported serializer for DataStream transmission " +
-                "in typeSerializerOut of {}", lastNode.getOperatorName());
+                    "in typeSerializerOut of {}", lastNode.getOperatorName());
             return true;
         }
         return false;
     }
 
     private static boolean validateNodeForOmniTask(Integer vertexID, Map<Integer, StreamConfig> vertexConfigs,
-        JobType jobType, StreamGraph streamGraph, StreamNode node) {
+                                                   JobType jobType, StreamGraph streamGraph, StreamNode node,
+                                                   boolean checkpointingEnabled) {
         String operatorName = node.getOperatorName();
         String operatorDescription = node.getOperatorDescription();
         switch (jobType) {
@@ -380,10 +413,10 @@ public final class OmniGraphOverride {
                     return true;
                 }
                 LOG.info("validateVertexChainInfoForOmniTask chainInfo of vertex ID {} "
-                        + "has the operator {} with description {}",
-                    vertexID, operatorName, operatorDescription);
+                                + "has the operator {} with description {}",
+                        vertexID, operatorName, operatorDescription);
                 if (validateOperatorByNameForOmniTask(operatorName, operatorDescription,
-                    node.getOperatorFactory())) {
+                        node.getOperatorFactory())) {
                     LOG.info("validateVertexChainInfoForOmniTask chainInfo of vertex ID {} "
                             + ": the operator {} is SUITABLE for OmniTask", vertexID, operatorName);
                 } else {
@@ -397,15 +430,15 @@ public final class OmniGraphOverride {
                 boolean result;
                 try {
                     result = validateWatermark(node) && StreamNodeOptimized.getInstance().setExtraDescription(
-                        node, streamConfig, streamGraph, jobType);
+                            node, streamConfig, streamGraph, jobType, checkpointingEnabled);
                 } catch (NoSuchFieldException | IllegalAccessException | IOException | ClassNotFoundException e) {
                     throw new FlinkRuntimeException(
-                        "Error occurs during the process of compatibility between new and old sinks or sources", e);
+                            "Error occurs during the process of compatibility between new and old sinks or sources", e);
                 }
 
                 if (!result) {
                     LOG.info("setExtraDescription StreamNode of vertex ID  {} "
-                        + ": the operator {} is NOT SUITABLE for OmniTask", vertexID, operatorName);
+                            + ": the operator {} is NOT SUITABLE for OmniTask", vertexID, operatorName);
                     return true;
                 }
                 break;
@@ -422,7 +455,8 @@ public final class OmniGraphOverride {
      * @param streamNode the operator object.
      * @return return the reulst weather the operator should rollback or not.
      *
-     * */
+     *
+     */
     private static boolean validateWatermark(StreamNode streamNode) {
         if (streamNode.getOperatorName().toLowerCase(Locale.ROOT).contains(WATERMARK[0])
                 || streamNode.getOperatorName().toLowerCase(Locale.ROOT).contains(WATERMARK[1])) {
@@ -565,7 +599,7 @@ public final class OmniGraphOverride {
     }
 
     private static JobType getSourceJobType(StreamNode node, String operatorName, JobType jobType,
-        List<String> inputTypeList) {
+                                            List<String> inputTypeList) {
         TypeSerializer<?> typeSerializerOut = node.getTypeSerializerOut();
         if (typeSerializerOut == null) {
             throw new FlinkRuntimeException("Empty type serializer out for operator " + operatorName);
@@ -640,9 +674,9 @@ public final class OmniGraphOverride {
 
     // true for omniTask
     private static boolean validateOperatorByNameForOmniTask(String operatorName, String operatorDescription,
-        StreamOperatorFactory operatorFactory) {
+                                                             StreamOperatorFactory operatorFactory) {
         if (isSource(operatorName)) {
-            return validateSource(operatorDescription);
+            return validateSource(operatorDescription, operatorFactory);
         } else if (isSink(operatorName)) {
             return validateSink(operatorName, operatorFactory);
         } else if (isConstraintEnforcer(operatorName)) {
@@ -666,7 +700,7 @@ public final class OmniGraphOverride {
             Map<String, Object> jsonMap = toJsonMap(operatorDescription);
 
             AbstractValidateOperatorStrategy validateStrategy =
-                ValidateOperatorStrategyFactory.getStrategy(opSimpleName);
+                    ValidateOperatorStrategyFactory.getStrategy(opSimpleName);
             return validateStrategy.executeValidateOperator(jsonMap);
         }
     }
@@ -680,7 +714,7 @@ public final class OmniGraphOverride {
     }
 
     private static boolean validateSink(String operatorName, StreamOperatorFactory operatorFactory) {
-        if (!isSinkSupportNative)  {
+        if (!isSinkSupportNative) {
             return false;
         }
         if (performanceMode && operatorName.contains("StreamingFileWriter")) {
@@ -695,12 +729,18 @@ public final class OmniGraphOverride {
         }
         Object recordSerializer = ReflectionUtils.retrievePrivateField(sink, "recordSerializer");
         Object valueSerializationSchema = ReflectionUtils
-            .retrievePrivateField(recordSerializer, "valueSerialization");
+                .retrievePrivateField(recordSerializer, "valueSerialization");
         return "JsonRowDataSerializationSchema".equals(valueSerializationSchema.getClass().getSimpleName());
     }
 
-    private static boolean validateSource(String operatorDescription) {
+    private static boolean validateSource(String operatorDescription, StreamOperatorFactory operatorFactory) {
         if (!isSourceSupportNative) {
+            return false;
+        }
+        // VALUES-based sources (SimpleInputFormatOperatorFactory) are not supported
+        // in native SQL execution because OmniStream does not handle them
+        if (operatorFactory instanceof SimpleInputFormatOperatorFactory) {
+            LOG.info("validateSource: VALUES-based source (SimpleInputFormatOperatorFactory) is not supported for native execution");
             return false;
         }
         if (!operatorDescription.contains("originDescription")) {
@@ -714,16 +754,16 @@ public final class OmniGraphOverride {
             return false;
         }
         if (!jsonMap.containsKey("deserializationSchema")
-            || !(jsonMap.get("deserializationSchema") instanceof String)
-            || !SUPPORT_KAFKA_SCHEMA_TYPE.contains((String) jsonMap.get("deserializationSchema"))) {
+                || !(jsonMap.get("deserializationSchema") instanceof String)
+                || !SUPPORT_KAFKA_SCHEMA_TYPE.contains((String) jsonMap.get("deserializationSchema"))) {
             return false;
         }
         if (!jsonMap.containsKey("hasMetadata") || !(jsonMap.get("hasMetadata") instanceof Boolean)
-            || (Boolean) jsonMap.get("hasMetadata")) {
+                || (Boolean) jsonMap.get("hasMetadata")) {
             return false;
         }
         return jsonMap.containsKey("watermarkStrategy") && (jsonMap.get("watermarkStrategy") instanceof String)
-            && !((String) jsonMap.get("watermarkStrategy")).isEmpty();
+                && !((String) jsonMap.get("watermarkStrategy")).isEmpty();
     }
 
     private static Map<String, Object> toJsonMap(String operatorDescription) {
@@ -762,7 +802,7 @@ public final class OmniGraphOverride {
 
     private static String extractOperatorName(String operatorName) {
         Matcher matcher = operatorName.contains("WatermarkAssigner") || operatorName.contains("GroupAggregate")
-            ? WATERMARK_OP_NAME_REGEX.matcher(operatorName) : OPERATOR_NAME_REGEX.matcher(operatorName);
+                ? WATERMARK_OP_NAME_REGEX.matcher(operatorName) : OPERATOR_NAME_REGEX.matcher(operatorName);
         if (matcher.find()) {
             return matcher.group(1);
         } else {
@@ -773,7 +813,7 @@ public final class OmniGraphOverride {
     /**
      * 检查给定的算子链信息中是否包含特定类型的算子。
      *
-     * @param chainInfos 算子链信息的映射
+     * @param chainInfos            算子链信息的映射
      * @param operatorTypePredicate 一个 Predicate，用于判断 StreamOperator 是否是目标类型
      * @return 如果找到至少一个匹配的算子，则返回 true，否则返回 false
      */
@@ -803,7 +843,7 @@ public final class OmniGraphOverride {
     }
 
     private static boolean containsConversionOperator(List<StreamNode> chainedNode,
-            Predicate<StreamOperator<?>> operatorTypePredicate) {
+                                                      Predicate<StreamOperator<?>> operatorTypePredicate) {
         // the operator is in reverse order within chainedNode
         for (int i = chainedNode.size() - 1; i >= 0; i--) {
             StreamOperator<?> operator = chainedNode.get(i).getOperator();

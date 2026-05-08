@@ -94,7 +94,7 @@ TEST(DeserializerTestSuite, DeserializesLocalStateSnapshotFromFile) {
     }) << "The output of ToString() is not valid JSON. Output was: " << to_string_output;
 
     EXPECT_EQ(parsed_json["stateHandleName"], "TaskStateSnapshot");
-    std::string opIdHex = "4BF7C1955FFE56E2106D666433EAF137";
+    std::string opIdHex = "4bf7c1955ffe56e2106d666433eaf137";
     ASSERT_TRUE(parsed_json["subtaskStatesByOperatorID"].contains(opIdHex));
 }
 
@@ -197,5 +197,55 @@ TEST(DeserializerTestSuite, DeserializesRemoteStateSnapshotFromFile) {
     EXPECT_EQ(privateState.at(1).getLocalPath(), "000040.sst");
     EXPECT_EQ(relativeFileHandle->GetStateSize(), 22776);
 //    delete snapshot;
+}
+
+TEST(DeserializerTestSuite, DeserializesRemoteStateSnapshotWithPlainJavaHandleArrays) {
+    const std::string json_content = R"({
+        "subtaskStatesByOperatorID": {
+            "4bf7c1955ffe56e2106d666433eaf137": {
+                "managedKeyedState": ["org.apache.flink.runtime.checkpoint.StateObjectCollection", [{
+                    "@class": "IncrementalRemoteKeyedStateHandle",
+                    "backendIdentifier": "8d43f905-8fcb-491d-95df-87e4597464e4",
+                    "keyGroupRange": {"startKeyGroup": 0, "endKeyGroup": 127},
+                    "checkpointId": 1,
+                    "privateState": [{
+                        "handle": {
+                            "@class": "ByteStreamStateHandle",
+                            "handleName": "MANIFEST-000001",
+                            "data": "AQID"
+                        },
+                        "localPath": "MANIFEST-000001"
+                    }],
+                    "metaStateHandle": {
+                        "@class": "ByteStreamStateHandle",
+                        "handleName": "meta",
+                        "data": "AQID"
+                    },
+                    "stateHandleId": {"keyString": "13bbca3d-116b-4d9f-aeff-ad55c9cb29e1"},
+                    "persistedSizeOfThisCheckpoint": 3
+                }]],
+                "inputChannelState": ["org.apache.flink.runtime.checkpoint.StateObjectCollection", []],
+                "resultSubpartitionState": ["org.apache.flink.runtime.checkpoint.StateObjectCollection", []]
+            }
+        },
+        "isTaskDeployedAsFinished": false,
+        "isTaskFinished": false
+    })";
+
+    auto snapshot = TaskStateSnapshotDeserializer::Deserialize(json_content);
+    ASSERT_NE(snapshot, nullptr);
+
+    OperatorID opIdWithState =
+        TaskStateSnapshotDeserializer::HexStringToOperatorId<OperatorID>("4bf7c1955ffe56e2106d666433eaf137");
+    auto state = snapshot->GetSubtaskStateByOperatorID(opIdWithState);
+    ASSERT_NE(state, nullptr);
+
+    const auto& keyedStateHandles = state->GetManagedKeyedState();
+    ASSERT_EQ(keyedStateHandles.Size(), 1);
+    auto remoteHandle = std::dynamic_pointer_cast<IncrementalRemoteKeyedStateHandle>(keyedStateHandles.ToArray().at(0));
+    ASSERT_NE(remoteHandle, nullptr);
+    EXPECT_TRUE(remoteHandle->GetSharedState().empty());
+    ASSERT_EQ(remoteHandle->GetPrivateState().size(), 1);
+    EXPECT_EQ(remoteHandle->GetPrivateState().at(0).getLocalPath(), "MANIFEST-000001");
 }
 

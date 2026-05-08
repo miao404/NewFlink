@@ -35,15 +35,4 @@ public class DataStreamRemoteDataFetcher extends RemoteDataFetcher {
             List<OmniRemoteInputChannel> remoteInputChannels) {
         super(nativeTaskRef, taskName, jobType, remoteInputChannels);
     }
-    
-    public void recycleBuffer(long address, Buffer buffer) {
-        if (address != -1 && buffer != null) {
-            waitingForRecycleBuffers.put(address, buffer);
-            LOG.info("Buffer with address {} added to waiting for recycle buffers.", address);
-        } else {
-            LOG.warn("Attempted to recycle a null buffer or with invalid address: {}", address);
-        }
-    }
-    
-    
 }

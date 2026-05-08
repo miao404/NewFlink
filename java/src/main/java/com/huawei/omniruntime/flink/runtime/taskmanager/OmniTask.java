@@ -22,6 +22,7 @@
 package com.huawei.omniruntime.flink.runtime.taskmanager;
 
 import com.huawei.omniruntime.flink.runtime.api.graph.json.JsonHelper;
+import com.huawei.omniruntime.flink.runtime.api.graph.json.descriptor.ResultPartitionIDPOJO;
 import com.huawei.omniruntime.flink.runtime.io.network.partition.OriginalTaskDataFetcher;
 import com.huawei.omniruntime.flink.runtime.metrics.exception.GeneralRuntimeException;
 import com.huawei.omniruntime.flink.runtime.metrics.groups.OmniTaskMetricGroup;
@@ -35,6 +36,7 @@ import org.apache.flink.api.common.ExecutionConfig;
 import org.apache.flink.api.common.cache.DistributedCache;
 import org.apache.flink.api.common.typeinfo.BasicTypeInfo;
 import org.apache.flink.api.common.typeutils.TypeSerializer;
+import org.apache.flink.contrib.streaming.state.RocksDBSharedResources;
 import org.apache.flink.contrib.streaming.state.RocksDBStateUploader;
 import org.apache.flink.core.fs.CloseableRegistry;
 import org.apache.flink.core.fs.FileSystemSafetyNet;
@@ -77,12 +79,14 @@ import org.apache.flink.runtime.io.network.partition.consumer.OmniRemoteInputCha
 import org.apache.flink.runtime.io.network.partition.consumer.RecoveredInputChannel;
 import org.apache.flink.runtime.io.network.partition.consumer.RemoteInputChannel;
 import org.apache.flink.runtime.io.network.partition.consumer.SingleInputGate;
+import org.apache.flink.runtime.io.network.partition.consumer.LocalRecoveredInputChannel;
 import org.apache.flink.runtime.jobgraph.OperatorID;
 import org.apache.flink.runtime.jobgraph.tasks.CoordinatedTask;
 import org.apache.flink.runtime.jobgraph.tasks.InputSplitProvider;
 import org.apache.flink.runtime.jobgraph.tasks.TaskInvokable;
 import org.apache.flink.runtime.jobgraph.tasks.TaskOperatorEventGateway;
 import org.apache.flink.runtime.memory.MemoryManager;
+import org.apache.flink.runtime.memory.OpaqueMemoryResource;
 import org.apache.flink.runtime.metrics.groups.InternalOperatorMetricGroup;
 import org.apache.flink.runtime.metrics.groups.TaskMetricGroup;
 import org.apache.flink.runtime.operators.coordination.OperatorEvent;
@@ -102,6 +106,7 @@ import org.apache.flink.runtime.state.CheckpointedStateScope;
 import org.apache.flink.runtime.state.IncrementalKeyedStateHandle.HandleAndLocalPath;
 import org.apache.flink.runtime.state.KeyedBackendSerializationProxy;
 import org.apache.flink.runtime.state.StateUtil;
+import org.apache.flink.runtime.state.LocalRecoveryConfig;
 import org.apache.flink.runtime.state.StreamStateHandle;
 import org.apache.flink.runtime.state.SnapshotResult;
 import org.apache.flink.runtime.state.TaskStateManager;
@@ -128,6 +133,7 @@ import org.apache.flink.util.FlinkException;
 import org.apache.flink.util.IOUtils;
 import org.apache.flink.util.SerializedValue;
 import org.apache.flink.util.jackson.JacksonMapperFactory;
+import org.json.JSONObject;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -141,9 +147,8 @@ import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.Executor;
-import java.util.concurrent.Future;
+import java.util.Objects;
+import java.util.concurrent.*;
 import javax.annotation.Nonnull;
 import javax.annotation.Nullable;
 
@@ -200,6 +205,8 @@ public class OmniTask extends Task {
 
     // temporarily use public for easy access from OmniTaskWrapper
     public RuntimeEnvironment checkpointingEnv;
+
+    private OpaqueMemoryResource<RocksDBSharedResources> rocksDBSharedResources;
     
     /**
      * <b>IMPORTANT:</b> This constructor may not start any work that would need to be undone in the
@@ -262,6 +269,15 @@ public class OmniTask extends Task {
         return taskStateManagerWrapper;
     }
 
+    public CheckpointStreamFactory getCheckpointStreamFactory(long checkpointId) throws IOException {
+        final CheckpointStorageAccess checkpointAccess = ((StreamTask<?, ?>) this.invokable).getEnvironment().getCheckpointStorageAccess();
+        try {
+            return checkpointAccess.resolveCheckpointStorageLocation(checkpointId, this.checkpointOptions.getTargetLocation());
+        } catch (IOException e) {
+            LOG.error("Could not resolve the checkpoint storage location.", e);
+            throw e;
+        }
+    }
     /**
      * The core work method that bootstraps the task and executes its code.
      */
@@ -355,6 +371,17 @@ public class OmniTask extends Task {
                 LOG.error("Error during metrics de-registration of task {} ({}).", taskNameWithSubtask, executionId,
                         t);
             }
+
+            // if rocksDBSharedResources was created in java, we need to close them
+            try {
+                if (rocksDBSharedResources != null) {
+                    rocksDBSharedResources.close();
+                }
+            } catch (Throwable t) {
+                LOG.error("Error during closing rocksDBSharedResources of task {} ({}).", taskNameWithSubtask, executionId, t);
+            }
+
+            deleteNativeTask(nativeTaskRef);
         }
     }
 
@@ -554,8 +581,10 @@ public class OmniTask extends Task {
             // meantime
             // restore original task first
             nativeTaskMetricGroupRef = createNativeTaskMetricGroup(nativeTaskRef);
-            // register omni metrics
-            omniTaskMetricGroup = registerOmniTaskMetrics();
+            // register omni metrics, code: omniTaskMetricGroup = registerOmniTaskMetrics().
+            // After nativeTask is deleted, the Java side may still call the native interface to obtain
+            // old metric data (which has been deleted and becomes a dangling pointer), causing
+            // TaskManager to coredump. Therefore, omni metric data is temporarily not registered.
 
             if (!transitionState(ExecutionState.DEPLOYING, ExecutionState.INITIALIZING)) {
                 throw new CancelTaskException();
@@ -567,16 +596,15 @@ public class OmniTask extends Task {
             // make sure the user code classloader is accessible thread-locally
             executingThread.setContextClassLoader(userCodeClassLoader.asClassLoader());
 
+            // call native restore and invoke before java
+            notifyChannelToOmni(inputGates);
+            long status = doRunRestoreNativeTask(nativeTaskRef, nativeStreamTask);
             // create RemoteDataFetcher for remote input channelsE
-
             originalTaskDataFetcher = createAndStartRemoteDataFetcher(inputGates);
-
             if (!transitionState(ExecutionState.INITIALIZING, ExecutionState.RUNNING)) {
                 throw new CancelTaskException();
             }
             taskManagerActions.updateTaskExecutionState(new TaskExecutionState(executionId, ExecutionState.RUNNING));
-            // call native restore and invoke before java
-            long status = doRunRestoreNativeTask(nativeTaskRef, nativeStreamTask);
             registerEventDispatcher((StreamTask<?, ?>) invokable);
             status = doRunInvokeNativeTask(nativeTaskRef, nativeStreamTask);
         } else {
@@ -833,6 +861,30 @@ public class OmniTask extends Task {
         }
     }
 
+    private void notifyChannelToOmni(IndexedInputGate[] inputGates) {
+        if (!isTaskNative()) {
+            return;
+        }
+        for (IndexedInputGate inputGate : inputGates) {
+            InputGateWithMetrics inputGateWithMetrics = (InputGateWithMetrics) inputGate;
+            int numberOfChannels = inputGateWithMetrics.getNumberOfInputChannels();
+            for (int i = 0; i < numberOfChannels; i++) {
+                InputChannel inputChannel = inputGateWithMetrics.getChannel(i);
+                if (!(inputChannel instanceof LocalRecoveredInputChannel)) {
+                    continue;
+                }
+                boolean targetIsNative = checkIfTargetResultPartitionIsNative(inputChannel.getPartitionId());
+                if (targetIsNative) {
+                    continue;
+                }
+                ResultPartitionIDPOJO resultPartitionIDPOJO = new ResultPartitionIDPOJO(inputChannel.getPartitionId());
+                JSONObject jsonObject = new JSONObject(resultPartitionIDPOJO);
+                String parititonIdString = jsonObject.toString();
+                notifyChannelToOmni(nativeTaskRef, parititonIdString);
+            }
+        }
+    }
+
     private OriginalTaskDataFetcher createAndStartRemoteDataFetcher(IndexedInputGate[] inputGates) throws IOException {
         if (isTaskNative()) {
             List<OmniRemoteInputChannel> remoteInputChannels = new ArrayList<>();
@@ -871,7 +923,7 @@ public class OmniTask extends Task {
             
             if (!remoteInputChannels.isEmpty() || !localInputChannels.isEmpty()) {
                 OriginalTaskDataFetcher originalTaskDataFetcher = new OriginalTaskDataFetcher(nativeTaskRef,
-                        this.getTaskInfo().getTaskName(), jobType);
+                        this.getTaskInfo().getTaskNameWithSubtasks(), jobType);
                 if (!remoteInputChannels.isEmpty()) {
                     originalTaskDataFetcher.createAndStartRemoteDataFetcher(remoteInputChannels);
                 }
@@ -966,16 +1018,23 @@ public class OmniTask extends Task {
         triggerCheckpointCpp(nativeTaskRef,checkpointID,checkpointTimestamp,checkpointOptionsString);
     }
 
+    public RuntimeEnvironment getCheckpointingEnv() {
+        return this.checkpointingEnv;
+    }
+
+    public ExecutionConfig getExecutionConfig() {
+        StreamTask<?, ?> streamTask = (StreamTask<?, ?>) this.invokable;
+        return Objects.requireNonNull(streamTask).getExecutionConfig();
+    }
+
     public SnapshotResult<StreamStateHandle> materializeMetaData(
             final long checkpointId,
-            final List<StateMetaInfoSnapshot> stateMetaInfoSnapshots)
-            throws Exception {
-        
-        if (this.checkpointOptions == null) {
-            LOG.info("checkpointOptions not initialized, using default location");
-            this.checkpointOptions = CheckpointOptions.forCheckpointWithDefaultLocation();
-        }
-        
+            final List<StateMetaInfoSnapshot> stateMetaInfoSnapshots,
+            final LocalRecoveryConfig localRecoveryConfig,
+            final CheckpointOptions checkpointOptions,
+            TypeSerializer<?> keySerializer) throws Exception {
+        this.checkpointOptions = checkpointOptions;
+
         final CloseableRegistry snapshotCloseableRegistry = new CloseableRegistry();
         final CloseableRegistry tmpResourcesRegistry = new CloseableRegistry();
 
@@ -983,14 +1042,22 @@ public class OmniTask extends Task {
         this.checkpointStreamFactory = checkpointAccess.resolveCheckpointStorageLocation(checkpointId, this.checkpointOptions.getTargetLocation());
 
         CheckpointStreamWithResultProvider streamWithResultProvider =
-                CheckpointStreamWithResultProvider.createSimpleStream(
+                localRecoveryConfig != null && localRecoveryConfig.isLocalRecoveryEnabled()
+                ? CheckpointStreamWithResultProvider.createDuplicatingStream(
+                        checkpointId,
+                        CheckpointedStateScope.EXCLUSIVE,
+                        checkpointStreamFactory,
+                        localRecoveryConfig.getLocalStateDirectoryProvider()
+                                .orElseThrow(LocalRecoveryConfig.localRecoveryNotEnabled()))
+                :CheckpointStreamWithResultProvider.createSimpleStream(
                         CheckpointedStateScope.EXCLUSIVE, checkpointStreamFactory);
 
         snapshotCloseableRegistry.registerCloseable(streamWithResultProvider);
 
         try {
-            final TypeSerializer<?> keySerializer =
-                    BasicTypeInfo.LONG_TYPE_INFO.createSerializer(((StreamTask<?, ?>) this.invokable).getExecutionConfig());
+            keySerializer = (null != keySerializer)
+                    ? keySerializer
+                    : BasicTypeInfo.STRING_TYPE_INFO.createSerializer(((StreamTask<?, ?>) this.invokable).getExecutionConfig());
             
             KeyedBackendSerializationProxy<?> serializationProxy =
                     new KeyedBackendSerializationProxy<>(keySerializer, stateMetaInfoSnapshots, false);
@@ -1029,12 +1096,11 @@ public class OmniTask extends Task {
         final CheckpointedStateScope stateScope = CheckpointedStateScope.SHARED;
 
         List<HandleAndLocalPath> handles = new ArrayList<>();
-        try {
+        try (RocksDBStateUploader uploader = new RocksDBStateUploader(numberOfSnapshottingThreads)) {
             if (paths == null || paths.isEmpty()) {
                 return Collections.emptyList();
             }
-    
-            RocksDBStateUploader uploader = new RocksDBStateUploader(numberOfSnapshottingThreads);
+
             handles =
                     uploader.uploadFilesToCheckpointFs(
                             paths,
@@ -1044,7 +1110,10 @@ public class OmniTask extends Task {
                             tmpResourcesRegistry);
             LOG.info("Checkpoint files uploaded");
         } catch (Throwable t) {
+            tmpResourcesRegistry.close();
             LOG.info("Error closing registry", t);
+        } finally {
+            snapshotCloseableRegistry.close();
         }
         return handles;
     }
@@ -1147,7 +1216,7 @@ public class OmniTask extends Task {
         ChannelStateWriter stateWriter = getChannelStateWriter(localInputChannel);
         OmniLocalInputChannel omniLocalInputChannel = new OmniLocalInputChannel(localInputChannel, partitionManager,
                 nativeTaskRef, singleInputGate, initialBackoff, maxBackoff, numBytesIn, numBuffersIn,
-                taskEventPublisher, stateWriter, this.getTaskInfo().getTaskName());
+                taskEventPublisher, stateWriter, this.getTaskInfo().getTaskNameWithSubtasks());
         return omniLocalInputChannel;
     }
     
@@ -1160,7 +1229,7 @@ public class OmniTask extends Task {
         return consumers;
     }
     
-    private void deleteParentTaskInSlotTable() {
+    private synchronized void deleteParentTaskInSlotTable() {
         for (IndexedInputGate inputGate : this.inputGates) {
             int numOfChannel = inputGate.getNumberOfInputChannels();
             for (int i = 0; i < numOfChannel; i++) {
@@ -1219,13 +1288,74 @@ public class OmniTask extends Task {
         return result;
     }
 
+    public CheckpointStreamWithResultProvider acquireSavepointOutputStream(long checkpointId, CheckpointOptions checkpointOptions) throws Exception {
+        this.checkpointOptions = checkpointOptions;
+        final CheckpointStorageAccess checkpointAccess = ((StreamTask<?, ?>) this.invokable).getEnvironment().getCheckpointStorageAccess();
+        this.checkpointStreamFactory = checkpointAccess.resolveCheckpointStorageLocation(checkpointId, this.checkpointOptions.getTargetLocation());
+        return CheckpointStreamWithResultProvider.createSimpleStream(
+                CheckpointedStateScope.EXCLUSIVE, checkpointStreamFactory);
+    }
+
+    public void writeSavepointOutputStream(CheckpointStreamWithResultProvider provider, byte[] chunk) throws Exception {
+        provider.getCheckpointOutputStream().write(chunk);
+    }
+
+    public void writeSavepointMetadata(
+            CheckpointStreamWithResultProvider provider,
+            final List<StateMetaInfoSnapshot> stateMetaInfoSnapshots,
+            TypeSerializer<?> keySerializer) throws Exception {
+
+        keySerializer = (null != keySerializer)
+                ? keySerializer
+                : BasicTypeInfo.STRING_TYPE_INFO.createSerializer(((StreamTask<?, ?>) this.invokable).getExecutionConfig());
+        
+        KeyedBackendSerializationProxy<?> serializationProxy =
+                new KeyedBackendSerializationProxy<>(keySerializer, stateMetaInfoSnapshots, false);
+        final DataOutputView out =
+                new DataOutputViewStreamWrapper(provider.getCheckpointOutputStream());
+        serializationProxy.write(out);
+    }
+
+    public long getSavepointOutputStreamPos(CheckpointStreamWithResultProvider provider) throws Exception {
+        return provider.getCheckpointOutputStream().getPos();
+    }
+
+    public SnapshotResult<StreamStateHandle> closeSavepointOutputStream(CheckpointStreamWithResultProvider provider)
+        throws Exception {
+        StreamStateHandle handle = (StreamStateHandle)provider
+            .closeAndFinalizeCheckpointStreamResult()
+            .getJobManagerOwnedSnapshot();
+        return SnapshotResult.of(handle);
+    }
+
     // return nativeAddressOfStreamTask
     private native long setupStreamTaskBeforeInvoke(long nativeTaskRef, String StreamTaskClassName /* possible other
      parameter*/);
 
+    public native void notifyChannelToOmni(long nativeTaskRef, String partitionId);
+
     private native long doRunRestoreNativeTask(long nativeTaskRef, long streamTaskRef /* possible other parameter*/);
 
     private native long doRunInvokeNativeTask(long nativeTaskRef, long streamTaskRef /* possible other parameter */);
+
+    private void deleteNativeTask(long nativeTaskToBeDeleted) {
+        if (nativeTaskToBeDeleted != 0) {
+            ExecutorService deleteNativeTaskExecutorService = Executors.newSingleThreadExecutor();
+            deleteNativeTaskExecutorService.submit(() -> {
+                long delay = 120;
+                LOG.info("Delete native task {} after {} seconds.", nativeTaskToBeDeleted, delay);
+                try {
+                    Thread.sleep(delay * 1000);
+                } catch (InterruptedException e) {
+                    LOG.error("Interrupted while waiting to delete native task {}", nativeTaskToBeDeleted, e);
+                }
+                doDeleteNativeTask(nativeTaskToBeDeleted);
+                LOG.info("Native task {} has been deleted.", nativeTaskToBeDeleted);
+            });
+        }
+    }
+
+    private native void doDeleteNativeTask(long nativeTaskRef);
 
     private native void dispatchOperatorEvent(long nativeTaskRef, String operatorId, String eventDesc);
 
@@ -1242,6 +1372,11 @@ public class OmniTask extends Task {
     public void setTaskOperatorGatewayWrapper(TaskOperatorGatewayWrapper taskOperatorGatewayWrapper) {
         this.taskOperatorGatewayWrapper = taskOperatorGatewayWrapper;
     }
+
+    public void setRocksDBSharedResources(OpaqueMemoryResource<RocksDBSharedResources> rocksDBSharedResources) {
+        this.rocksDBSharedResources = rocksDBSharedResources;
+    }
+
     private native long cancelTask(long nativeTaskRef);
     private native void abortCpp(long nativeTaskRef,long checkpointId,long latestCompletedCheckpointId);
     private native void completeCpp(long nativeTaskRef,long checkpointId, long isRunning);

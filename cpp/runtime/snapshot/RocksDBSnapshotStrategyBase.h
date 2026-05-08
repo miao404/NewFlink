@@ -65,17 +65,18 @@ public:
     );
 
     std::string getDescription() const;
-    SnapshotResources *syncPrepareResources(long checkpointId);
+    std::shared_ptr<SnapshotResources> syncPrepareResources(long checkpointId);
     void cleanupIncompleteSnapshot(
             std::shared_ptr<SnapshotDirectory> localBackupDirectory
     );
 
     virtual std::shared_ptr<SnapshotResultSupplier<KeyedStateHandle>> asyncSnapshot(
-            SnapshotResources* snapshotResources,
+            const std::shared_ptr<SnapshotResources>& snapshotResources,
             long checkpointId,
             long timestamp,
             CheckpointStreamFactory* checkpointStreamFactory,
-            CheckpointOptions* checkpointOptions) = 0;
+            CheckpointOptions* checkpointOptions,
+            std::string keySerializer = "") = 0;
 protected:
     virtual std::shared_ptr<PreviousSnapshot> snapshotMetaData(
             long checkpointId,
@@ -85,9 +86,12 @@ protected:
     std::shared_ptr<SnapshotResult<StreamStateHandle>> materializeMetaData(
             std::vector<std::shared_ptr<StateMetaInfoSnapshot>>& stateMetaInfoSnapshots,
             long checkpointId,
-            std::shared_ptr<omnistream::OmniTaskBridge> bridge)
+            CheckpointOptions *checkpointOptions,
+            std::shared_ptr<omnistream::OmniTaskBridge> bridge,
+            std::string keySerializer = "")
     {
-        return bridge->CallMaterializeMetaData(checkpointId, stateMetaInfoSnapshots);
+        return bridge->CallMaterializeMetaData(checkpointId, stateMetaInfoSnapshots, localRecoveryConfig_,
+                                               checkpointOptions, keySerializer);
     };
 
     std::shared_ptr<SnapshotDirectory> prepareLocalSnapshotDirectory(long checkpointId);
@@ -113,10 +117,11 @@ protected:
                 long checkpointId,
                 CheckpointStreamFactory* checkpointStreamFactory,
                 std::shared_ptr<SnapshotDirectory> localBackupDirectory,
-                std::vector<std::shared_ptr<StateMetaInfoSnapshot>> stateMetaInfoSnapshots);
+                std::vector<std::shared_ptr<StateMetaInfoSnapshot>> stateMetaInfoSnapshots,
+                std::shared_ptr<TypeSerializer> keySerializer);
 
         virtual ~RocksDBSnapshotOperation() = default;
-        SnapshotResult<KeyedStateHandle> *get(std::shared_ptr<omnistream::OmniTaskBridge> bridge) override;
+        std::shared_ptr<SnapshotResult<KeyedStateHandle>> get(std::shared_ptr<omnistream::OmniTaskBridge> bridge) override;
 
     protected:
         std::shared_ptr<KeyedStateHandle> getLocalSnapshot(
@@ -129,6 +134,7 @@ protected:
         std::vector<std::shared_ptr<StateMetaInfoSnapshot>> stateMetaInfoSnapshots;
         std::shared_ptr<SnapshotDirectory> localBackupDirectory;
         std::shared_ptr<CloseableRegistry> tmpResourcesRegistry;
+        std::shared_ptr<TypeSerializer> keySerializer;
     };
 };
 
@@ -156,13 +162,14 @@ public:
     std::shared_ptr<SnapshotDirectory> snapshotDirectory;
     std::shared_ptr<PreviousSnapshot> previousSnapshot;
     std::vector<std::shared_ptr<StateMetaInfoSnapshot>> stateMetaInfoSnapshots;
+    std::shared_ptr<TypeSerializer> keySerializer;
 };
 
 class SnapshotResultSupplierEmpty :  public SnapshotResultSupplier<KeyedStateHandle> {
 public:
-    SnapshotResult<KeyedStateHandle> *get(std::shared_ptr<omnistream::OmniTaskBridge> bridge) override
+    std::shared_ptr<SnapshotResult<KeyedStateHandle>> get(std::shared_ptr<omnistream::OmniTaskBridge> bridge) override
     {
-        return SnapshotResult<KeyedStateHandle>::Empty().get();
+        return SnapshotResult<KeyedStateHandle>::Empty();
     }
 };
 

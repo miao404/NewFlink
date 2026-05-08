@@ -25,6 +25,7 @@ import static org.apache.flink.util.Preconditions.checkState;
 
 import com.huawei.omniruntime.flink.runtime.api.graph.json.JobInformationPOJO;
 import com.huawei.omniruntime.flink.runtime.api.graph.json.JsonHelper;
+import com.huawei.omniruntime.flink.runtime.api.graph.json.TaskStateSnapshotDeser;
 import com.huawei.omniruntime.flink.runtime.api.graph.json.StreamConfigPOJO;
 import com.huawei.omniruntime.flink.runtime.api.graph.json.TaskInformationPOJO;
 import com.huawei.omniruntime.flink.runtime.api.graph.json.descriptor.TaskDeploymentDescriptorPOJO;
@@ -40,6 +41,12 @@ import com.huawei.omniruntime.flink.utils.UdfUtil;
 import org.apache.flink.api.common.JobID;
 import org.apache.flink.api.common.time.Time;
 import org.apache.flink.configuration.Configuration;
+import org.apache.flink.configuration.ConfigOptions;
+import org.apache.flink.configuration.GlobalConfiguration;
+import org.apache.flink.contrib.streaming.state.RocksDBMemoryConfiguration;
+import org.apache.flink.contrib.streaming.state.RocksDBOperationUtils;
+import org.apache.flink.contrib.streaming.state.RocksDBSharedResources;
+import org.apache.flink.core.memory.ManagedMemoryUseCase;
 import org.apache.flink.runtime.blob.PermanentBlobKey;
 import org.apache.flink.runtime.blob.TaskExecutorBlobService;
 import org.apache.flink.runtime.checkpoint.CheckpointException;
@@ -59,6 +66,7 @@ import org.apache.flink.runtime.jobgraph.tasks.InputSplitProvider;
 import org.apache.flink.runtime.jobgraph.tasks.TaskOperatorEventGateway;
 import org.apache.flink.runtime.jobmaster.JobMasterId;
 import org.apache.flink.runtime.memory.MemoryManager;
+import org.apache.flink.runtime.memory.OpaqueMemoryResource;
 import org.apache.flink.runtime.messages.Acknowledge;
 import org.apache.flink.runtime.metrics.MetricNames;
 import org.apache.flink.runtime.metrics.groups.TaskManagerJobMetricGroup;
@@ -106,6 +114,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 
 import javax.annotation.Nullable;
 
@@ -115,13 +124,50 @@ import javax.annotation.Nullable;
  * @since 2025-04-27
  */
 public class OmniTaskExecutor extends TaskExecutor {
+
+    // -------------------------------- FALCON Implementation --------------------------------
+
+    /**
+     * Calculate falcon cache size limit of each slot, and add the info into each subTask (ExecutionAttemptID). Slot
+     * cache size is set as "TMCacheSize / TMSlotNum"
+     * @brief FALCON implementation
+     * @param executionAttemptID subTask execution info, including subTask num in the same slot, and slot cache size
+     */
+    public void calculateSlotFalconSize(ExecutionAttemptID executionAttemptID) {
+        // if enable falcon cache, configure falcon memory manager, set cache size of each slot into ExecutionAttemptID
+        final boolean enableFalconCache = GlobalConfiguration.loadConfiguration().get(
+            ConfigOptions.key("state.backend.rocksdb.falcon.use-state-cache")
+                .booleanType()
+                .defaultValue(false)
+                .withDescription("If true, falcon cache will be used for RocksDBValueState and RocksDBMapState.")
+        );
+        if (enableFalconCache) {
+            // each taskManager can cache at most "taskManagerFalconSize" state items.
+            final int taskManagerFalconSize = GlobalConfiguration.loadConfiguration().get(
+                ConfigOptions.key("state.backend.rocksdb.falcon.state-cache-sizeLimit")
+                    .intType()
+                    .defaultValue(12000)
+                    .withDescription("The maximum number of state items that can be cached by each TaskManager, " +
+                            " which is set as 12000 by default.")
+            );
+            int numSlots = taskManagerConfiguration.getNumberSlots(); // num slots in current taskManager
+            int slotFalconSize = (numSlots == 0) ? 0 : taskManagerFalconSize / numSlots;
+            executionAttemptID.setSlotFalconSize(slotFalconSize);
+            // this log will be print n times, where n = numSubTasks
+            log.info("[FALCON] configuring falcon cache heap memory management system. current TM have {} slots, " +
+                    "so each slot can cache {} states.", numSlots, slotFalconSize);
+        }
+    }
+
+    // ---------------------------------------------------------------------------------------
+
     private static final Logger LOG = LoggerFactory.getLogger(OmniTaskExecutor.class);
 
     private long nativeTaskExecutorReference;
 
     private OmniShuffleEnvironment omniShuffleEnvironment;
     private OmniTaskManagerServices omniTaskManagerServices;
-    private Map<ExecutionAttemptID, OmniTaskReferenceCounter> taskMap = new HashMap<>();
+    private Map<ExecutionAttemptID, OmniTaskReferenceCounter> taskMap = new ConcurrentHashMap<>();
 
     public OmniTaskExecutor(RpcService rpcService,
                             TaskManagerConfiguration taskManagerConfiguration,
@@ -201,6 +247,8 @@ public class OmniTaskExecutor extends TaskExecutor {
             final JobID jobId = tdd.getJobId();
             final ExecutionAttemptID executionAttemptID = tdd.getExecutionAttemptId();
 
+            calculateSlotFalconSize(executionAttemptID); // [FALCON] calculate slot falcon size
+
             final JobTable.Connection jobManagerConnection = getJobManagerConnection(tdd, jobMasterId, jobId);
 
             // re-integrate offloaded data:
@@ -248,8 +296,10 @@ public class OmniTaskExecutor extends TaskExecutor {
 
             try {
                 taskAdded = taskSlotTable.addTask(task);
-                deleteLeftTaskInTaskMap(executionAttemptID);
-                taskMap.put(task.getExecutionId(), new OmniTaskReferenceCounter(task));
+                synchronized (this) {
+                    deleteLeftTaskInTaskMap(executionAttemptID);
+                    taskMap.put(task.getExecutionId(), new OmniTaskReferenceCounter(task));
+                }
             } catch (SlotNotFoundException | SlotNotActiveException e) {
                 throw new TaskSubmissionException("Could not submit task.", e);
             }
@@ -286,24 +336,18 @@ public class OmniTaskExecutor extends TaskExecutor {
             Collection<URL> requiredClasspaths = jobInformation.getRequiredClasspathURLs();
             UserCodeClassLoader codeClassLoader = createUserCodeClassloader(classLoaderHandle,
                 requiredJarFiles, requiredClasspaths);
+            MemoryManager memoryManager = taskSlotTable.getTaskMemoryManager(tdd.getAllocationId());
             Configuration conf = taskInformation.getTaskConfiguration();
             StreamConfig streamConfig = new StreamConfig(conf);
             StreamConfigPOJO streamConfigPOJO = new StreamConfigPOJO(streamConfig, codeClassLoader.asClassLoader());
-            LOG.info("StreamConfigPOJO is {}", streamConfigPOJO);
-            LOG.info("StreamConfigPOJO JSON is {}", JsonHelper.toJson(streamConfigPOJO));
 
             // task information pojo
             TaskInformationPOJO taskInformationPOJO = new TaskInformationPOJO(taskInformation,
-                codeClassLoader.asClassLoader(), task.getTaskInfo().getIndexOfThisSubtask(), taskManagerConfiguration);
-
-            LOG.info("TaskInformationPOJO is {}", taskInformationPOJO);
-            LOG.info("TaskInformationPOJO JSON is {}", JsonHelper.toJson(taskInformationPOJO));
+                codeClassLoader.asClassLoader(), task.getTaskInfo().getIndexOfThisSubtask(), taskManagerConfiguration, memoryManager);
 
             // job information POJO
             JobInformationPOJO jobInformationPOJO = new JobInformationPOJO(
                 jobInformation, codeClassLoader.asClassLoader());
-            LOG.info("JobInformationPOJO is {}", jobInformationPOJO);
-            LOG.info("JobInformationPOJO JSON is {}", JsonHelper.toJson(jobInformationPOJO));
 
             // tdd pojo
             TaskDeploymentDescriptorPOJO tddPojo = getTaskDeploymentDescriptorPOJO(tdd);
@@ -330,11 +374,25 @@ public class OmniTaskExecutor extends TaskExecutor {
                 getLocalRecoveryConfig(new TaskParam(tdd, tdd.getJobId(), taskInformation, jobInformation));
             taskInformationPOJO.setLocalRecoveryConfig(Objects.toString(localRecoveryConfig, ""));
 
-            OmniTaskWrapper omniTaskWrapper=new OmniTaskWrapper(task);
-            long nativeTaskAddress = submitTaskNativeWithCheckpointing(this.nativeTaskExecutorReference, JsonHelper.toJson(jobInformationPOJO),
-                    JsonHelper.toJson(taskInformationPOJO), JsonHelper.toJson(tddPojo), task.getTaskStateManagerWrapper(),omniTaskWrapper,task.getTaskOperatorGatewayWrapper());
-            ((OmniTask) task).bindNativeTask(nativeTaskAddress);
-            ((OmniTask) task).setJobType(JobType.fromValue(jobType));
+            OmniTaskWrapper omniTaskWrapper = new OmniTaskWrapper(task);
+
+            String streamConfigPOJOJson = JsonHelper.toJson(streamConfigPOJO);
+            LOG.info("StreamConfigPOJO is {}", streamConfigPOJO);
+            LOG.info("StreamConfigPOJO JSON is {}", streamConfigPOJOJson);
+            String taskInformationPOJOJson = JsonHelper.toJson(taskInformationPOJO);
+            LOG.info("TaskInformationPOJO is {}", taskInformationPOJO);
+            LOG.info("TaskInformationPOJO JSON is {}", taskInformationPOJOJson);
+            String jobInformationPOJOJson = JsonHelper.toJson(jobInformationPOJO);
+            LOG.info("JobInformationPOJO is {}", jobInformationPOJO);
+            LOG.info("JobInformationPOJO JSON is {}", jobInformationPOJOJson);
+            String tddPojoJson = JsonHelper.toJson(tddPojo);
+            LOG.info("TaskDeploymentDescriptorPOJO is {}", tddPojo);
+            LOG.info("TaskDeploymentDescriptorPOJO JSON is {}", tddPojoJson);
+
+            long nativeTaskAddress = submitTaskNativeWithCheckpointing(this.nativeTaskExecutorReference, jobInformationPOJOJson,
+                    taskInformationPOJOJson, tddPojoJson, task.getTaskStateManagerWrapper(), omniTaskWrapper, task.getTaskOperatorGatewayWrapper());
+            task.bindNativeTask(nativeTaskAddress);
+            task.setJobType(JobType.fromValue(jobType));
         } else {
             log.info("Task {} is not an OmniTask, no need to create OmniTask.", task.getExecutionId());
         }
@@ -344,15 +402,21 @@ public class OmniTaskExecutor extends TaskExecutor {
         TaskDeploymentDescriptorPOJO tddPojo = new TaskDeploymentDescriptorPOJO(tdd);
         JobManagerTaskRestore restore = tdd.getTaskRestore();
         if (restore != null) {
-            String restoreJson = JsonHelper.toJsonWithAllFields(restore.getTaskStateSnapshot());
-            tddPojo.setTaskStateSnapshot(restoreJson);
-            tddPojo.setRestoreCheckpointId(restore.getRestoreCheckpointId());
-            LOG.info("TaskStateSnapshot JSON is {}", restoreJson);
+            try {
+                String restoreJson = TaskStateSnapshotDeser.serializeTaskStateSnapshot(
+                    restore.getTaskStateSnapshot());
+                tddPojo.setTaskStateSnapshot(restoreJson);
+                tddPojo.setRestoreCheckpointId(restore.getRestoreCheckpointId());
+                LOG.debug("TaskStateSnapshot JSON is {}", restoreJson);
+            } catch (Exception e) {
+                LOG.error("Failed to serialize TaskStateSnapshot, falling back to JsonHelper", e);
+                String restoreJson = JsonHelper.toJsonWithAllFields(restore.getTaskStateSnapshot());
+                tddPojo.setTaskStateSnapshot(restoreJson);
+                tddPojo.setRestoreCheckpointId(restore.getRestoreCheckpointId());
+            }
         } else {
             LOG.warn("JobManagerTaskRestore is null in TDD");
         }
-        LOG.info("TaskDeploymentDescriptorPOJO is {}", tddPojo);
-        LOG.info("TaskDeploymentDescriptorPOJO JSON is {}", JsonHelper.toJson(tddPojo));
         return tddPojo;
     }
 
@@ -405,7 +469,7 @@ public class OmniTaskExecutor extends TaskExecutor {
                         aggregateManager, classLoaderHandle, fileCache, taskManagerConfiguration, taskMetricGroup,
                         partitionStateChecker, getRpcService().getScheduledExecutor(), taskMap,
                         taskStateManagerWrapper,taskOperatorGatewayWrapper);
-
+        taskStateManagerWrapper.setOmniTask(task);
         taskMetricGroup.gauge(MetricNames.IS_BACK_PRESSURED, task::isBackPressured);
         return task;
     }
@@ -535,7 +599,7 @@ public class OmniTaskExecutor extends TaskExecutor {
         return jobManagerConnection;
     }
     
-    private void deleteLeftTaskInTaskMap(ExecutionAttemptID executionAttemptID) {
+    private synchronized void deleteLeftTaskInTaskMap(ExecutionAttemptID executionAttemptID) {
         if (!taskMap.isEmpty()) {
             ExecutionAttemptID existId = taskMap.keySet().toArray(new ExecutionAttemptID[0])[0];
             Object existGraphId = getFieldByReflection(ExecutionAttemptID.class, existId, "executionGraphId");
@@ -578,6 +642,33 @@ public class OmniTaskExecutor extends TaskExecutor {
             TaskStateManagerWrapper taskStateManagerWrapper,
             OmniTaskWrapper omniTaskWrapper,
             TaskOperatorGatewayWrapper taskOperatorGatewayWrapper);
+
+
+    private OpaqueMemoryResource<RocksDBSharedResources> allocateNativeRocksDBSharedResources(
+            TaskInformationPOJO taskInformationPOJO,
+            ClassLoader cl,
+            MemoryManager memoryManager,
+            RocksDBMemoryConfiguration rocksDBMemoryConfiguration
+    ) throws IOException {
+
+        if (!"EmbeddedRocksDBStateBackend".equals(taskInformationPOJO.getStateBackend()) || taskInformationPOJO.getStateBackendManagedMemoryFraction() == 0.0) {
+            return null;
+        }
+
+        OpaqueMemoryResource<RocksDBSharedResources> rocksDBSharedResources =
+                RocksDBOperationUtils.allocateSharedCachesIfConfigured(
+                        rocksDBMemoryConfiguration,
+                        memoryManager,
+                        taskInformationPOJO.getStateBackendManagedMemoryFraction(),
+                        LOG
+                );
+
+        if (rocksDBSharedResources == null) {
+            throw new IllegalArgumentException("rocksDBSharedResources is null, OmniStream not support. Please check the configuration.");
+        }
+
+        return rocksDBSharedResources;
+    }
 
 
     // ----------------------------------------------------------------------

@@ -29,7 +29,12 @@ namespace omnistream {
           bridge_(bridge),
           jobManagerTaskRestore_(jobManagerTaskRestore),
           omniTaskBridge_(omniTaskBridge)
-    {}
+    {
+        std::shared_ptr<TaskStateSnapshot> taskStateSnapshot =
+                jobManagerTaskRestore == nullptr ? std::make_shared<TaskStateSnapshot>()
+                                                 : jobManagerTaskRestore->getTaskStateSnapshot();
+        sequentialChannelStateReader_ = std::make_shared<SequentialChannelStateReaderImpl>(taskStateSnapshot, omniTaskBridge);
+    }
 
 TaskStateManager::~TaskStateManager()
 {
@@ -103,7 +108,10 @@ PrioritizedOperatorSubtaskState TaskStateManager::prioritizedOperatorState(const
 
     long restoreCheckpointId = jobManagerTaskRestore_->getRestoreCheckpointId();
 
-    std::shared_ptr<TaskStateSnapshot> localStateSnapshot = localStateStore_->retrieveLocalState(restoreCheckpointId);
+    std::shared_ptr<TaskStateSnapshot> localStateSnapshot = bridge_->RetrieveLocalState(restoreCheckpointId);
+    if (localStateSnapshot == nullptr) {
+        LOG("load local snapshot failed!");
+    }
 
     localStateStore_->pruneMatchingCheckpoints(
         [restoreCheckpointId](long checkpointId) -> bool {

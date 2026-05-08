@@ -15,9 +15,10 @@
 #include "data/RowData.h"
 #include "table/runtime/operators/window/TimeWindow.h"
 #include "runtime/state/VoidNamespace.h"
+#include "basictypes/Object.h"
 
 template <typename K, typename N>
-class TimerHeapInternalTimer : public InternalTimer<K, N> {
+class TimerHeapInternalTimer : public InternalTimer<K, N>, public Object {
 public:
     TimerHeapInternalTimer(long timestamp, K key, N nameSpace)
         : key(key), nameSpace(nameSpace), timestamp(timestamp), timerHeapIndex(0)
@@ -25,12 +26,18 @@ public:
         if constexpr (std::is_same_v<K, Object*>) {
             reinterpret_cast<Object*>(key)->getRefCount();
         }
+        if constexpr (std::is_same_v<N, Object*>) {
+            reinterpret_cast<Object*>(nameSpace)->getRefCount();
+        }
     };
 
     ~TimerHeapInternalTimer()
     {
         if constexpr (std::is_same_v<K, Object*>) {
             reinterpret_cast<Object*>(key)->putRefCount();
+        }
+        if constexpr (std::is_same_v<N, Object*>) {
+            reinterpret_cast<Object*>(nameSpace)->putRefCount();
         }
     }
 
@@ -54,6 +61,15 @@ public:
     {
         if constexpr (std::is_same_v<K, RowData *>) {
             return this->timestamp == other.timestamp && *this->key == *other.key && this->nameSpace == other.nameSpace;
+        } else if constexpr (std::is_same_v<K, Object *>) {
+            auto lkey = reinterpret_cast<Object*>(this->key);
+            auto rkey = reinterpret_cast<Object*>(other.key);
+            if (lkey == nullptr && rkey == nullptr) {
+                return true;
+            } else if (lkey == nullptr || rkey == nullptr) {
+                return false;
+            }
+            return lkey->equals(rkey) && this->timestamp == other.timestamp && this->nameSpace == other.nameSpace;
         } else {
             return this->timestamp == other.timestamp && this->key == other.key && this->nameSpace == other.nameSpace;
         }
@@ -62,6 +78,41 @@ public:
     bool operator!=(TimerHeapInternalTimer<K, N> &other) const
     {
         return !(*this == other);
+    }
+
+	inline void setKey(K key_) {
+        if constexpr (std::is_same_v<K, Object*>) {
+            reinterpret_cast<Object*>(key)->putRefCount();
+        }
+        key = key_;
+        if constexpr (std::is_same_v<K, Object*>) {
+            reinterpret_cast<Object*>(key)->getRefCount();
+        }
+	}
+
+    inline void setNamespace(N nameSpace_) {
+        if constexpr (std::is_same_v<N, Object*>) {
+            reinterpret_cast<Object*>(nameSpace)->putRefCount();
+        }
+        nameSpace = nameSpace_;
+        if constexpr (std::is_same_v<N, Object*>) {
+            reinterpret_cast<Object*>(nameSpace)->getRefCount();
+        }
+	}
+
+	inline void setTimestamp(long timestamp_) {
+		timestamp = timestamp_;
+    }
+
+
+    void clear() {
+        if constexpr (std::is_same_v<K, Object*>) {
+            reinterpret_cast<Object*>(key)->putRefCount();
+        }
+        if constexpr (std::is_same_v<N, Object*>) {
+            reinterpret_cast<Object*>(nameSpace)->putRefCount();
+        }
+        return;
     }
 
 private:
@@ -90,9 +141,11 @@ namespace std {
             int result = static_cast<int>(timestamp ^ (timestamp >> 32));
             if constexpr (std::is_same_v<K, RowData *>) {
                 result = 31 * result + key->hashCode();
+            } else if constexpr (std::is_same_v<K, Object *>) {
+                result = 31 * result + reinterpret_cast<Object*>(key)->hashCode();
             }
             if constexpr (std::is_same_v<N, TimeWindow>) {
-                result = 31 * result + nameSpace.HashCode();
+                result = 31 * result + nameSpace.hashCode();
             } else if constexpr (std::is_same_v<N, VoidNamespace>) {
                 result = 31 * result + ((VoidNamespace)nameSpace).hashCode();
             } else {
@@ -110,6 +163,18 @@ namespace std {
                 return *lhs->getKey() == *rhs->getKey() &&
                         lhs->getTimestamp() == rhs->getTimestamp() &&
                         lhs->getNamespace() == rhs->getNamespace();
+            } else if constexpr (std::is_same_v<K, Object *>) {
+                auto lkey = reinterpret_cast<Object*>(lhs->getKey());
+                auto rkey = reinterpret_cast<Object*>(rhs->getKey());
+                if (lkey == nullptr && rkey == nullptr) {
+                    return true;
+                } else if (lkey == nullptr || rkey == nullptr) {
+                    return false;
+                }
+                auto res = lkey->equals(rkey) &&
+                           lhs->getTimestamp() == rhs->getTimestamp() &&
+                           lhs->getNamespace() == rhs->getNamespace();
+                return res;
             } else {
                 return lhs->getKey() == rhs->getKey() &&
                         lhs->getTimestamp() == rhs->getTimestamp() &&

@@ -6,6 +6,7 @@
 #include "state/filesystem/FileStateHandle.h"
 #include "state/memory/ByteStreamStateHandle.h"
 #include "state/filesystem/RelativeFileStateHandle.h"
+#include "typeinfo/TypeInfoFactory.h"
 
 enum class StreamStateHandleType {
     Unknown,
@@ -389,7 +390,10 @@ std::shared_ptr<SnapshotResult<StreamStateHandle>> ConvertSnapshotResult(JNIEnv*
 
 std::shared_ptr<SnapshotResult<StreamStateHandle>> OmniTaskBridgeImpl2::CallMaterializeMetaData(
     jlong checkpointId,
-    std::vector<std::shared_ptr<StateMetaInfoSnapshot>>& snapshots)
+    std::vector<std::shared_ptr<StateMetaInfoSnapshot>>& snapshots,
+    std::shared_ptr<LocalRecoveryConfig> localRecoveryConfig,
+    CheckpointOptions *checkpointOptions,
+    std::string keySerializer)
 {
     if (m_globalOmniTaskRef == nullptr) {
         GErrorLog("StreamTask is not registered in TaskStateManagerBridgeImpl::CallMaterializeMetaData");
@@ -402,7 +406,10 @@ std::shared_ptr<SnapshotResult<StreamStateHandle>> OmniTaskBridgeImpl2::CallMate
         GErrorLog("Failed to attach C++ thread to JVM inside TaskStateManagerBridgeImpl::CallMaterializeMetaData");
         return nullptr;
     }
-
+    if (checkpointOptions == nullptr) {
+        GErrorLog("checkpointOptions is nullptr in TaskStateManagerBridgeImpl::CallMaterializeMetaData");
+        return nullptr;
+    }
     nlohmann::json stateMetaInfoJson = nlohmann::json::array();
     for (const auto& snapshot : snapshots) {
         nlohmann::json jsonObj;
@@ -410,21 +417,69 @@ std::shared_ptr<SnapshotResult<StreamStateHandle>> OmniTaskBridgeImpl2::CallMate
         jsonObj["backendStateType"] =
         static_cast<int>(StateMetaInfoSnapshot::getCode(snapshot->getBackendStateType()));
         jsonObj["options"] = snapshot->getOptionsImmutable();
+        jsonObj["serializer"] = snapshot->getSerializerJson();
+        jsonObj["keySerializer"] = keySerializer;
         stateMetaInfoJson.push_back(std::move(jsonObj));
     }
     std::string stateMetaInfoStr = stateMetaInfoJson.dump();
 
+    std::string localRecoveryConfigStr = "{}";
+    if (localRecoveryConfig != nullptr && localRecoveryConfig->IsLocalRecoveryEnabled()){
+        try {
+            nlohmann::json localRecoveryJson;
+            auto directoryProvider = localRecoveryConfig->GetLocalStateDirectoryProvider();
+
+            // 序列化 allocationBaseDirs_
+            nlohmann::json baseDirsArray = nlohmann::json::array();
+            for (const auto& path : directoryProvider->GetPaths()) {
+                baseDirsArray.push_back(path.string()); // 将filesystem::path转换为字符串
+            }
+            localRecoveryJson["allocationBaseDirs"] = baseDirsArray;
+
+            // 序列化 jobID_
+            localRecoveryJson["jobID"] = directoryProvider->GetJobIdHexStr();
+
+            // 序列化 jobVertexID_
+            localRecoveryJson["jobVertexID"] = directoryProvider->GetVertexIdHexStr();
+
+            // 序列化 subtaskIndex_
+            localRecoveryJson["subtaskIndex"] = directoryProvider->GetSubIndex();
+
+            localRecoveryConfigStr = localRecoveryJson.dump();
+
+        } catch (const std::exception& e) {
+            std::stringstream errorMsg;
+            errorMsg << "Failed to serialize localRecoveryConfig: " << e.what();
+            GErrorLog(errorMsg.str());
+            localRecoveryConfigStr = "{}"; // 序列化失败时使用空JSON
+        }
+
+    }
+    nlohmann::json jcheckpointOptions = checkpointOptions->ToJson();
+    std::string checkpointOptionsStr = jcheckpointOptions.dump();
     jclass cls = env->GetObjectClass(m_globalOmniTaskRef);
     jmethodID mid = env->GetMethodID(
         cls,
         "materializeMetaData",
-        "(JLjava/lang/String;)Lorg/apache/flink/runtime/state/SnapshotResult;"
+        "(JLjava/lang/String;Ljava/lang/String;Ljava/lang/String;)Lorg/apache/flink/runtime/state/SnapshotResult;"
     );
     jstring jStateMetaInfoStr = env->NewStringUTF(stateMetaInfoStr.c_str());
-    jobject resultObj = env->CallObjectMethod(m_globalOmniTaskRef, mid, checkpointId, jStateMetaInfoStr);
-
+    jstring jLocalRecoveryConfigStr = env->NewStringUTF(localRecoveryConfigStr.c_str());
+    jstring jcheckpointOptionsStr = env->NewStringUTF(checkpointOptionsStr.c_str());
+    jobject resultObj = env->CallObjectMethod(m_globalOmniTaskRef, mid, checkpointId, jStateMetaInfoStr, jLocalRecoveryConfigStr, jcheckpointOptionsStr);
+    if (env->ExceptionCheck()) {
+        env->ExceptionDescribe();
+        env->ExceptionClear();
+        env->DeleteLocalRef(jStateMetaInfoStr);
+        env->DeleteLocalRef(jLocalRecoveryConfigStr);
+        env->DeleteLocalRef(cls);
+        env->DeleteLocalRef(jcheckpointOptionsStr);
+        throw std::runtime_error("Failed to call materializeMetaData");
+    }
     env->DeleteLocalRef(jStateMetaInfoStr);
+    env->DeleteLocalRef(jLocalRecoveryConfigStr);
     env->DeleteLocalRef(cls);
+    env->DeleteLocalRef(jcheckpointOptionsStr);
 
     return ConvertSnapshotResult(env, resultObj);
 }
@@ -460,6 +515,256 @@ jobject OmniTaskBridgeImpl2::CallUploadFilesToCheckpointFs(const std::vector<Pat
     return jResult;
 }
 
+jobject ConvertToJavaByteStreamStateHandle(JNIEnv* env, const ByteStreamStateHandle& cppHandle)
+{
+    // 1. 获取 Java 类和方法 ID
+    jclass byteStreamStateHandleClass = env->FindClass(
+        "org/apache/flink/runtime/state/memory/ByteStreamStateHandle");
+    if (!byteStreamStateHandleClass) {
+        env->ExceptionDescribe();
+        return nullptr;
+    }
+
+    jmethodID constructor = env->GetMethodID(
+        byteStreamStateHandleClass,
+        "<init>",
+        "(Ljava/lang/String;[B)V");
+    if (!constructor) {
+        env->ExceptionDescribe();
+        env->DeleteLocalRef(byteStreamStateHandleClass);
+        return nullptr;
+    }
+
+    // 2. 转换 handleName
+    jstring jHandleName = env->NewStringUTF(cppHandle.GetHandleName().c_str());
+    if (!jHandleName) {
+        env->DeleteLocalRef(byteStreamStateHandleClass);
+        return nullptr;
+    }
+
+    // 3. 转换 data (std::vector<uint8_t> -> jbyteArray)
+    const auto& cppData = cppHandle.GetData();
+    jbyteArray jData = env->NewByteArray(static_cast<jsize>(cppData.size()));
+    if (!jData) {
+        env->DeleteLocalRef(jHandleName);
+        env->DeleteLocalRef(byteStreamStateHandleClass);
+        return nullptr;
+    }
+    env->SetByteArrayRegion(
+        jData,
+        0,
+        static_cast<jsize>(cppData.size()),
+        reinterpret_cast<const jbyte*>(cppData.data()));
+
+    // 4. 创建 Java 对象
+    jobject javaHandle = env->NewObject(
+        byteStreamStateHandleClass,
+        constructor,
+        jHandleName,
+        jData);
+
+    // 5. 清理局部引用
+    env->DeleteLocalRef(jHandleName);
+    env->DeleteLocalRef(jData);
+    env->DeleteLocalRef(byteStreamStateHandleClass);
+
+    return javaHandle;
+}
+
+jobject ConvertToJavaFileStateHandle(JNIEnv* env, const FileStateHandle& cppHandle)
+{
+    // 1. 获取Java类和方法
+    jclass fileStateHandleClass = env->FindClass("org/apache/flink/runtime/state/filesystem/FileStateHandle");
+    if (!fileStateHandleClass) {
+        env->ExceptionDescribe();
+        return nullptr;
+    }
+
+    jmethodID constructor = env->GetMethodID(
+        fileStateHandleClass,
+        "<init>",
+        "(Lorg/apache/flink/core/fs/Path;J)V");
+    if (!constructor) {
+        env->ExceptionDescribe();
+        env->DeleteLocalRef(fileStateHandleClass);
+        return nullptr;
+    }
+
+    // 2. 转换文件路径（Path对象）
+    // 先获取Java的Path类
+    jclass pathClass = env->FindClass("org/apache/flink/core/fs/Path");
+    jmethodID pathConstructor = env->GetMethodID(pathClass, "<init>", "(Ljava/lang/String;)V");
+
+    // 将C++路径转换为Java字符串
+    std::string filePathStr = cppHandle.GetFilePath().toString();
+    jstring jFilePathStr = env->NewStringUTF(filePathStr.c_str());
+
+    // 创建Java Path对象
+    jobject javaPath = env->NewObject(pathClass, pathConstructor, jFilePathStr);
+
+    // 3. 创建Java FileStateHandle对象
+    jobject javaHandle = env->NewObject(
+        fileStateHandleClass,
+        constructor,
+        javaPath,
+        static_cast<jlong>(cppHandle.GetStateSize())
+    );
+
+    // 4. 清理局部引用
+    env->DeleteLocalRef(jFilePathStr);
+    env->DeleteLocalRef(javaPath);
+    env->DeleteLocalRef(pathClass);
+    env->DeleteLocalRef(fileStateHandleClass);
+
+    return javaHandle;
+}
+
+jobject ConvertToJavaRelativeFileStateHandle(JNIEnv* env, const RelativeFileStateHandle& cppHandle)
+{
+    // 1. 获取Java类和方法
+    jclass relativeHandleClass = env->FindClass(
+        "org/apache/flink/runtime/state/filesystem/RelativeFileStateHandle");
+    if (!relativeHandleClass) {
+        env->ExceptionDescribe();
+        return nullptr;
+    }
+
+    jmethodID constructor = env->GetMethodID(
+        relativeHandleClass,
+        "<init>",
+        "(Lorg/apache/flink/core/fs/Path;Ljava/lang/String;J)V");
+    if (!constructor) {
+        env->ExceptionDescribe();
+        env->DeleteLocalRef(relativeHandleClass);
+        return nullptr;
+    }
+
+    // 2. 转换文件路径（复用FileStateHandle的Path转换逻辑）
+    jclass pathClass = env->FindClass("org/apache/flink/core/fs/Path");
+    jmethodID pathConstructor = env->GetMethodID(pathClass, "<init>", "(Ljava/lang/String;)V");
+
+    std::string filePathStr = cppHandle.GetFilePath().toString();
+    jstring jFilePathStr = env->NewStringUTF(filePathStr.c_str());
+    jobject javaPath = env->NewObject(pathClass, pathConstructor, jFilePathStr);
+
+    // 3. 转换相对路径
+    jstring jRelativePath = env->NewStringUTF(cppHandle.GetRelativePath().c_str());
+
+    // 4. 创建Java对象
+    jobject javaHandle = env->NewObject(
+        relativeHandleClass,
+        constructor,
+        javaPath,
+        jRelativePath,
+        static_cast<jlong>(cppHandle.GetStateSize())
+    );
+
+    // 5. 清理局部引用
+    env->DeleteLocalRef(jFilePathStr);
+    env->DeleteLocalRef(javaPath);
+    env->DeleteLocalRef(jRelativePath);
+    env->DeleteLocalRef(pathClass);
+    env->DeleteLocalRef(relativeHandleClass);
+
+    return javaHandle;
+}
+
+jobject ConvertPathStrToJavaPath(JNIEnv* env, const std::filesystem::path& restoreInstancePath)
+{
+    // 1. 获取Java的Paths类和get方法
+    jclass pathsClass = env->FindClass("java/nio/file/Paths");
+    if (pathsClass == nullptr) {
+        // 类未找到处理
+        return nullptr;
+    }
+
+    // 2. 获取Paths.get(String, String...)方法
+    jmethodID getMethod = env->GetStaticMethodID(
+        pathsClass,
+        "get",
+        "(Ljava/lang/String;[Ljava/lang/String;)Ljava/nio/file/Path;");
+    if (getMethod == nullptr) {
+        // 方法未找到处理
+        env->DeleteLocalRef(pathsClass);
+        return nullptr;
+    }
+
+    // 3. 将fs::path转换为jstring
+    jstring pathString = env->NewStringUTF(restoreInstancePath.string().c_str());
+
+    // 4. 创建空的String数组作为可变参数（Paths.get的第二个参数）
+    jobjectArray emptyArray = env->NewObjectArray(0, env->FindClass("java/lang/String"), nullptr);
+
+    // 5. 调用Paths.get方法
+    jobject javaPath = env->CallStaticObjectMethod(
+        pathsClass,
+        getMethod,
+        pathString,
+        emptyArray);
+
+    // 6. 清理局部引用
+    env->DeleteLocalRef(pathString);
+    env->DeleteLocalRef(emptyArray);
+    env->DeleteLocalRef(pathsClass);
+
+    return javaPath;
+}
+
+jobject ConvertToJavaStreamStateHandle(JNIEnv* env, const StreamStateHandle& cppHandle)
+{
+    // 动态类型检查（如果是 ByteStreamStateHandle）
+    if (auto byteHandle = dynamic_cast<const ByteStreamStateHandle*>(&cppHandle)) {
+        return ConvertToJavaByteStreamStateHandle(env, *byteHandle);
+    } else if (auto fileHandle = dynamic_cast<const FileStateHandle*>(&cppHandle)) {
+        return ConvertToJavaFileStateHandle(env, *fileHandle);
+    } else if (auto relHandle = dynamic_cast<const RelativeFileStateHandle*>(&cppHandle)) {
+        return ConvertToJavaRelativeFileStateHandle(env, *relHandle);
+    } else {
+        env->ThrowNew(
+            env->FindClass("java/lang/UnsupportedOperationException"),
+            "Unsupported StreamStateHandle type");
+        return nullptr;
+    }
+}
+
+bool OmniTaskBridgeImpl2::CallDownloadFileToLocal(const StreamStateHandle &cppHandle,
+    const std::string &restoreInstancePath)
+{
+    JNIEnv* env = nullptr;
+    jint attachRes = 0;
+    jint ret = g_OmniStreamJVM->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_8);
+    if (ret == JNI_EDETACHED) {
+        attachRes = g_OmniStreamJVM->AttachCurrentThread(reinterpret_cast<void**>(&env), nullptr);
+    }
+    if (attachRes != JNI_OK || env == nullptr) {
+        GErrorLog("Failed to attach C++ thread to JVM inside CallDownloadFileToLocal");
+        return false;
+    }
+
+    jobject restoreFileHandle = ConvertToJavaStreamStateHandle(env, cppHandle);
+    if (restoreFileHandle == nullptr) {
+        GErrorLog("Failed to convert to java stream state handle");
+        return false;
+    }
+    jobject restoreTargetPath = ConvertPathStrToJavaPath(env, restoreInstancePath);
+    if (restoreTargetPath == nullptr) {
+        GErrorLog("Failed to convert to java path");
+        return false;
+    }
+    jclass cls = env->GetObjectClass(m_globalOmniTaskRef);
+    // 获取CallDownloadFileToLocal方法ID
+    jmethodID mid = env->GetMethodID(cls, "callDownloadFileToLocal",
+        "(Lorg/apache/flink/runtime/state/StreamStateHandle;Ljava/nio/file/Path;)Z");
+    auto jResult = env->CallBooleanMethod(m_globalOmniTaskRef, mid, restoreFileHandle, restoreTargetPath);
+    env->DeleteLocalRef(cls);
+    if (env->ExceptionCheck()) {
+        env->ExceptionDescribe();
+        env->ExceptionClear();
+        return false;
+    }
+    return jResult == JNI_TRUE;
+}
+
 std::vector<StateMetaInfoSnapshot> convertResult(const std::string& cppResult)
 {
     // reconstruct std::vector<StateMetaInfoSnapshot>
@@ -477,19 +782,36 @@ std::vector<StateMetaInfoSnapshot> convertResult(const std::string& cppResult)
         for (const auto& [key, value] : oneSnapshot["optionsImmutable"].items()) {
             tmpOptions[key] = value.get<std::string>();
         }
+        std::unordered_map<std::string, TypeSerializer *> tmpSerializers;
+        if(oneSnapshot.contains("serializer")){
+            auto serializers = oneSnapshot["serializer"];
+            if(serializers.contains("namespaceSerializer")){
+                auto namespaceSerializer = TypeInfoFactory::createDataStreamTypeInfo(serializers["namespaceSerializer"]);
+                if(namespaceSerializer != nullptr){
+                    tmpSerializers.emplace("NAMESPACE_SERIALIZER", namespaceSerializer->getTypeSerializer());
+                }
+            }
+            if(serializers.contains("stateSerializer")){
+                auto stateSerializer = TypeInfoFactory::createDataStreamTypeInfo(serializers["stateSerializer"]);
+                if(stateSerializer != nullptr){
+                    tmpSerializers.emplace("VALUE_SERIALIZER", stateSerializer->getTypeSerializer());
+                }
+            }
+        }
         // Currently we don't take snapshot of serializers
         StateMetaInfoSnapshot::BackendStateType bst;
         auto backendStateTypeStr = oneSnapshot["backendStateType"].get<std::string>();
-        if (backendStateTypeStr == "KEY_VALUE" || backendStateTypeStr == "PRIORITY_QUEUE") {
+        if (backendStateTypeStr == "KEY_VALUE") {
             bst = StateMetaInfoSnapshot::BackendStateType::KEY_VALUE;
-        } else if (backendStateTypeStr == "OPERATOR" ||
-                   backendStateTypeStr == "BROADCAST") {
+        } else if (backendStateTypeStr == "PRIORITY_QUEUE") {
+            bst = StateMetaInfoSnapshot::BackendStateType::PRIORITY_QUEUE;
+        } else if (backendStateTypeStr == "OPERATOR" || backendStateTypeStr == "BROADCAST") {
             LOG("Unsupport BackendStateType.")
             continue;
         } else {
             throw std::runtime_error("Unknown BackendStateType.");
         }
-        toReturn.push_back(StateMetaInfoSnapshot(oneSnapshot["name"].get<std::string>(), bst, tmpOptions, {}, {}));
+        toReturn.push_back(StateMetaInfoSnapshot(oneSnapshot["name"].get<std::string>(), bst, tmpOptions, {}, tmpSerializers));
     }
     return toReturn;
 }
@@ -539,6 +861,449 @@ std::vector<StateMetaInfoSnapshot> OmniTaskBridgeImpl2::readMetaData(const std::
         return {};
     }
 }
+
+std::vector<int8_t> jbyteArrayToVector(JNIEnv* env, jbyteArray byteArray)
+{
+    std::vector<int8_t> result;
+    if (!byteArray) {
+        return result;
+    }
+
+    jsize length = env->GetArrayLength(byteArray);
+    if (length < 0) {
+        return result;
+    }
+
+    result.reserve(length);
+    jbyte* data = static_cast<jbyte*>(env->GetPrimitiveArrayCritical(byteArray, nullptr));
+    if (data != nullptr) {
+        result.assign(data, data + length);
+        env->ReleasePrimitiveArrayCritical(byteArray, data, JNI_ABORT);
+    }
+    return result;
+}
+
+void OmniTaskBridgeImpl2::getKeyGroupEntries(jobject inputStream,
+    int &currentKvStateId, bool isUsingKeyGroupCompression, std::vector<KeyGroupEntry> &entries)
+{
+    entries.clear();
+    JNIEnv* env;
+    jint res = g_OmniStreamJVM->AttachCurrentThread(reinterpret_cast<void**>(&env), nullptr);
+    if (res != JNI_OK) {
+        GErrorLog("Error: getKeyGroupEntries could not AttachCurrentThread for JNI call");
+        return;
+    }
+    if (m_globalOmniTaskRef != nullptr) {
+        jclass omniTaskWrapperClass = env->GetObjectClass(m_globalOmniTaskRef);
+        if (omniTaskWrapperClass == nullptr) {
+            GErrorLog("Error: getKeyGroupEntries could not GetObjectClass for JNI call");
+            g_OmniStreamJVM->DetachCurrentThread();
+            return;
+        }
+
+        jclass entryWrapperClass = env->FindClass("com/huawei/omniruntime/flink/runtime/restore/KeyGroupEntryWrapper");
+        jclass entryClass = env->FindClass("com/huawei/omniruntime/flink/runtime/restore/KeyGroupEntry");
+        if (unlikely(entryWrapperClass == nullptr || entryClass == nullptr)) {
+            GErrorLog("Error: getKeyGroupEntries could not FindClass for JNI call");
+            g_OmniStreamJVM->DetachCurrentThread();
+            return;
+        }
+
+        jfieldID currentKvStateIdField = env->GetFieldID(entryWrapperClass, "currentKvStateId", "I");
+        jfieldID entriesField = env->GetFieldID(entryWrapperClass, "entries", "[Lcom/huawei/omniruntime/flink/runtime/restore/KeyGroupEntry;");
+        jfieldID entryKvStateIdField = env->GetFieldID(entryWrapperClass, "kvStateId", "I");
+        jfieldID entryCountField = env->GetFieldID(entryWrapperClass, "count", "I");
+        if (unlikely(currentKvStateIdField == nullptr || entriesField == nullptr
+            || entryKvStateIdField == nullptr || entryCountField == nullptr)) {
+            GErrorLog("Error: getKeyGroupEntries entryWrapperClass could not GetFieldID for JNI call");
+            g_OmniStreamJVM->DetachCurrentThread();
+            return;
+        }
+
+        jfieldID entryKeyField = env->GetFieldID(entryClass, "key", "[B");
+        jfieldID entryValueField = env->GetFieldID(entryClass, "value", "[B");
+        if (unlikely(entryKeyField == nullptr || entryValueField == nullptr)) {
+            GErrorLog("Error: getKeyGroupEntries entryClass could not GetFieldID for JNI call");
+            g_OmniStreamJVM->DetachCurrentThread();
+            return;
+        }
+
+        jmethodID mid = env->GetMethodID(omniTaskWrapperClass, "getKeyGroupEntries",
+            "(Lorg/apache/flink/core/fs/FSDataInputStream;IZ)Lcom/huawei/omniruntime/flink/runtime/restore/KeyGroupEntryWrapper;");
+
+        jint jCurrentKvStateId = static_cast<jint>(currentKvStateId);
+        jboolean jIsUsingKeyGroupCompression = static_cast<jboolean>(isUsingKeyGroupCompression);
+
+        // Invoke the Java method
+        jobject result = env->CallObjectMethod(m_globalOmniTaskRef,
+            mid, inputStream, jCurrentKvStateId, jIsUsingKeyGroupCompression);
+
+        if (env->ExceptionCheck()) {
+            env->ExceptionDescribe(); // Print exception details to stderr
+            env->ExceptionClear();    // Clear the exception
+            g_OmniStreamJVM->DetachCurrentThread();
+            return;
+        }
+
+        if (result == nullptr) {
+            GErrorLog("Error: getKeyGroupEntries get null result for JNI call");
+            g_OmniStreamJVM->DetachCurrentThread();
+            return;
+        }
+
+        currentKvStateId = env->GetIntField(result, currentKvStateIdField);
+        int kvStateId = env->GetIntField(result, entryKvStateIdField);
+        int count = env->GetIntField(result, entryCountField);
+
+        jobjectArray entriesArray = static_cast<jobjectArray>(env->GetObjectField(result, entriesField));
+
+        for (int i = 0; i < count; i++) {
+            jobject entry = env->GetObjectArrayElement(entriesArray, i);
+            jbyteArray keyArray = static_cast<jbyteArray>(env->GetObjectField(entry, entryKeyField));
+            jbyteArray valueArray = static_cast<jbyteArray>(env->GetObjectField(entry, entryValueField));
+
+            entries.emplace_back(KeyGroupEntry(kvStateId, std::move(jbyteArrayToVector(env, keyArray)),
+                std::move(jbyteArrayToVector(env, valueArray))));
+            
+            if (entry) env->DeleteLocalRef(entry);
+            if (keyArray) env->DeleteLocalRef(keyArray);
+            if (valueArray) env->DeleteLocalRef(valueArray);
+        }
+        env->DeleteLocalRef(entriesArray);
+        env->DeleteLocalRef(entryWrapperClass);
+        env->DeleteLocalRef(entryClass);
+        env->DeleteLocalRef(result);
+        env->DeleteLocalRef(omniTaskWrapperClass);
+    } else {
+        GErrorLog("Error: Could not get TaskStateManagerWrapper class for JNI call");
+    }
+    g_OmniStreamJVM->DetachCurrentThread();
+}
+
+jobject OmniTaskBridgeImpl2::getSavepointInputStream(const std::string &metaStateHandle)
+{
+    JNIEnv* env;
+    jobject inputStream = nullptr;
+    jint res = g_OmniStreamJVM->AttachCurrentThread(reinterpret_cast<void**>(&env), nullptr);
+    if (res != JNI_OK) {
+        INFO_RELEASE("Error: getSavepointInputStream could not AttachCurrentThread for JNI call");
+        throw std::runtime_error("getSavepointInputStream could not AttachCurrentThread for JNI call");
+    }
+    if (m_globalOmniTaskRef != nullptr) {
+        jclass omniTaskWrapperClass = env->GetObjectClass(m_globalOmniTaskRef);
+        if (omniTaskWrapperClass == nullptr) {
+            g_OmniStreamJVM->DetachCurrentThread();
+            INFO_RELEASE("Error: getSavepointInputStream could not GetObjectClass for JNI call");
+            throw std::runtime_error("getSavepointInputStream could not GetObjectClass for JNI call");
+        }
+        jmethodID mid = env->GetMethodID(omniTaskWrapperClass, "getSavepointInputStream",
+            "(Ljava/lang/String;)Lorg/apache/flink/core/fs/FSDataInputStream;");
+        if (mid == nullptr) {
+            env->DeleteLocalRef(omniTaskWrapperClass); // Clean up local ref
+            g_OmniStreamJVM->DetachCurrentThread();
+            INFO_RELEASE("Error: getSavepointInputStream could not get methodID for JNI call");
+            throw std::runtime_error("getSavepointInputStream could not get methodID for JNI call");
+        }
+        jstring msHandle = env->NewStringUTF(metaStateHandle.c_str());
+        inputStream = env->CallObjectMethod(m_globalOmniTaskRef, mid, msHandle);
+        if (env->ExceptionCheck()) {
+            env->ExceptionDescribe();
+            env->ExceptionClear();
+            g_OmniStreamJVM->DetachCurrentThread();
+            INFO_RELEASE("Error: Failed to call SavepointInputStream get method");
+            throw std::runtime_error("Failed to call SavepointInputStream get method");
+        }
+        env->DeleteLocalRef(msHandle);
+        env->DeleteLocalRef(omniTaskWrapperClass);
+    } else {
+        INFO_RELEASE("Error: Could not get TaskStateManagerWrapper class for JNI call");
+        throw std::runtime_error("Could not get TaskStateManagerWrapper class for JNI call");
+    }
+    g_OmniStreamJVM->DetachCurrentThread();
+    return inputStream;
+}
+
+bool OmniTaskBridgeImpl2::isUsingKeyGroupCompression(jobject inputStream)
+{
+    JNIEnv* env;
+    bool result = false;
+    jint res = g_OmniStreamJVM->AttachCurrentThread(reinterpret_cast<void**>(&env), nullptr);
+    if (res != JNI_OK) {
+        INFO_RELEASE("Error: isUsingKeyGroupCompression could not AttachCurrentThread for JNI call");
+        return false;
+    }
+    if (m_globalOmniTaskRef != nullptr) {
+        jclass omniTaskWrapperClass = env->GetObjectClass(m_globalOmniTaskRef);
+        if (omniTaskWrapperClass == nullptr) {
+            INFO_RELEASE("Error: isUsingKeyGroupCompression could not GetObjectClass for JNI call");
+            g_OmniStreamJVM->DetachCurrentThread();
+            return false;
+        }
+        jmethodID mid = env->GetMethodID(omniTaskWrapperClass, "isUsingKeyGroupCompression",
+            "(Lorg/apache/flink/core/fs/FSDataInputStream;)Z");
+        if (mid == nullptr) {
+            INFO_RELEASE("Error: isUsingKeyGroupCompression could not GetMethodID for JNI call");
+            env->DeleteLocalRef(omniTaskWrapperClass); // Clean up local ref
+            g_OmniStreamJVM->DetachCurrentThread();
+            return false;
+        }
+        auto ret = env->CallBooleanMethod(m_globalOmniTaskRef, mid, inputStream);
+        if (env->ExceptionCheck()) {
+            env->ExceptionDescribe();
+            env->ExceptionClear();
+            g_OmniStreamJVM->DetachCurrentThread();
+            throw std::runtime_error("Failed to call SavepointInputStream use compression method");
+        }
+        result = (ret == JNI_TRUE);
+        env->DeleteLocalRef(omniTaskWrapperClass);
+    } else {
+        GErrorLog("Error: Could not get TaskStateManagerWrapper class for JNI call");
+    }
+    g_OmniStreamJVM->DetachCurrentThread();
+    return result;
+}
+
+void OmniTaskBridgeImpl2::setSavepointInputStreamOffset(jobject inputStream, int64_t offset)
+{
+    JNIEnv* env;
+    jint res = g_OmniStreamJVM->AttachCurrentThread(reinterpret_cast<void**>(&env), nullptr);
+    if (res != JNI_OK) {
+        INFO_RELEASE("Error: setSavepointInputStreamOffset could not AttachCurrentThread for JNI call");
+        throw std::runtime_error("setSavepointInputStreamOffset could not AttachCurrentThread for JNI call");
+    }
+    if (m_globalOmniTaskRef != nullptr) {
+        jclass omniTaskWrapperClass = env->GetObjectClass(m_globalOmniTaskRef);
+        if (omniTaskWrapperClass == nullptr) {
+            g_OmniStreamJVM->DetachCurrentThread();
+            INFO_RELEASE("Error: setSavepointInputStreamOffset could not GetObjectClass for JNI call");
+            throw std::runtime_error("setSavepointInputStreamOffset could not GetObjectClass for JNI call");
+        }
+        jmethodID mid = env->GetMethodID(omniTaskWrapperClass, "setSavepointInputStreamOffset",
+            "(Lorg/apache/flink/core/fs/FSDataInputStream;J)V");
+        if (mid == nullptr) {
+            env->DeleteLocalRef(omniTaskWrapperClass); // Clean up local ref
+            g_OmniStreamJVM->DetachCurrentThread();
+            INFO_RELEASE("Error: setSavepointInputStreamOffset could not GetMethodID for JNI call");
+            throw std::runtime_error("setSavepointInputStreamOffset could not GetMethodID for JNI call");
+        }
+        env->CallObjectMethod(m_globalOmniTaskRef, mid, inputStream, offset);
+        if (env->ExceptionCheck()) {
+            env->ExceptionDescribe();
+            env->ExceptionClear();
+            g_OmniStreamJVM->DetachCurrentThread();
+            INFO_RELEASE("Error: Failed to call SavepointInputStream set offset method");
+            throw std::runtime_error("Failed to call SavepointInputStream set offset method");
+        }
+        env->DeleteLocalRef(omniTaskWrapperClass);
+    } else {
+        INFO_RELEASE("Error: Could not get TaskStateManagerWrapper class for JNI call");
+        throw std::runtime_error("Could not get TaskStateManagerWrapper class for JNI call");
+    }
+    g_OmniStreamJVM->DetachCurrentThread();
+}
+
+void OmniTaskBridgeImpl2::closeSavepointInputStream(jobject inputStream)
+{
+    JNIEnv* env;
+    jint res = g_OmniStreamJVM->AttachCurrentThread(reinterpret_cast<void**>(&env), nullptr);
+    if (res != JNI_OK) {
+        INFO_RELEASE("Error: closeSavepointInputStream could not AttachCurrentThread for JNI call");
+        throw std::runtime_error("closeSavepointInputStream could not AttachCurrentThread for JNI call");
+    }
+    if (m_globalOmniTaskRef != nullptr) {
+        jclass omniTaskWrapperClass = env->GetObjectClass(m_globalOmniTaskRef);
+        if (omniTaskWrapperClass == nullptr) {
+            g_OmniStreamJVM->DetachCurrentThread();
+            INFO_RELEASE("Error: closeSavepointInputStream omniTaskWrapperClass == nullptr");
+            throw std::runtime_error("closeSavepointInputStream omniTaskWrapperClass == nullptr");
+        }
+        jmethodID mid = env->GetMethodID(omniTaskWrapperClass, "closeSavepointInputStream",
+            "(Lorg/apache/flink/core/fs/FSDataInputStream;)V");
+        if (mid == nullptr) {
+            env->DeleteLocalRef(omniTaskWrapperClass); // Clean up local ref
+            g_OmniStreamJVM->DetachCurrentThread();
+            INFO_RELEASE("Error: closeSavepointInputStream could not GetMethodID for JNI call");
+            throw std::runtime_error("closeSavepointInputStream could not GetMethodID for JNI call");
+        }
+        env->CallObjectMethod(m_globalOmniTaskRef, mid, inputStream);
+        if (env->ExceptionCheck()) {
+            env->ExceptionDescribe();
+            env->ExceptionClear();
+            env->DeleteLocalRef(inputStream);
+            g_OmniStreamJVM->DetachCurrentThread();
+            INFO_RELEASE("Error: Failed to call SavepointInputStream close method");
+            throw std::runtime_error("Failed to call SavepointInputStream close method");
+        }
+        env->DeleteLocalRef(omniTaskWrapperClass);
+        env->DeleteLocalRef(inputStream);
+    } else {
+        INFO_RELEASE("Error: Could not get TaskStateManagerWrapper class for JNI call");
+        throw std::runtime_error("Could not get TaskStateManagerWrapper class for JNI call");
+    }
+    g_OmniStreamJVM->DetachCurrentThread();
+}
+
+jobject OmniTaskBridgeImpl2::AcquireSavepointOutputStream(long checkpointId, CheckpointOptions *checkpointOptions)
+{
+    JNIEnv* env = nullptr;
+    jint ret = g_OmniStreamJVM->GetEnv(reinterpret_cast<void **>(&env), JNI_VERSION_1_8);
+    jint attachRes = 0;
+    if (ret == JNI_EDETACHED) {
+        attachRes = g_OmniStreamJVM->AttachCurrentThread(reinterpret_cast<void **>(&env), nullptr);
+    }
+    if (attachRes != JNI_OK || env == nullptr) {
+        INFO_RELEASE("Error: Failed to attach C++ thread to JVM inside AcquireSavepointOutputStream");
+        throw std::runtime_error("Failed to attach C++ thread to JVM inside AcquireSavepointOutputStream");
+    }
+    if (checkpointOptions == nullptr) {
+        INFO_RELEASE("Error: checkpointOptions is nullptr in TaskStateManagerBridgeImpl::AcquireSavepointOutputStream");
+        throw std::runtime_error("checkpointOptions is nullptr in TaskStateManagerBridgeImpl::AcquireSavepointOutputStream");
+    }
+    nlohmann::json jcheckpointOptions = checkpointOptions->ToJson();
+    std::string checkpointOptionsStr = jcheckpointOptions.dump();
+    jclass cls = env->GetObjectClass(m_globalOmniTaskRef);
+    jmethodID mid = env->GetMethodID(cls, "acquireSavepointOutputStream", "(JLjava/lang/String;)Lorg/apache/flink/runtime/state/CheckpointStreamWithResultProvider;");
+        jstring jcheckpointOptionsStr = env->NewStringUTF(checkpointOptionsStr.c_str());
+    auto localProvider =  env->CallObjectMethod(m_globalOmniTaskRef, mid, checkpointId, jcheckpointOptionsStr);
+    if (env->ExceptionCheck()) {
+        env->ExceptionDescribe();
+        env->ExceptionClear();
+        env->DeleteLocalRef(jcheckpointOptionsStr);
+        INFO_RELEASE("Error: Failed to call AcquireSavepointOutputStream");
+        throw std::runtime_error("Failed to call AcquireSavepointOutputStream");
+    }
+    env->DeleteLocalRef(jcheckpointOptionsStr);
+    if (localProvider == nullptr) {
+        return nullptr;
+    }
+    // CallObjectMethod 返回 local ref，仅在当前 JNI frame、当前线程有效。
+    // CheckpointStateOutputStreamProxy 会把 provider 跨线程（async checkpoint thread）
+    // 持续使用，必须升级为 global ref；CloseSavepointOutputStream 中 DeleteGlobalRef 释放。
+    jobject globalProvider = env->NewGlobalRef(localProvider);
+    env->DeleteLocalRef(localProvider);
+    return globalProvider;
+}
+
+std::shared_ptr<SnapshotResult<StreamStateHandle>> OmniTaskBridgeImpl2::CloseSavepointOutputStream(jobject provider)
+{
+    JNIEnv* env = nullptr;
+    jint ret = g_OmniStreamJVM->GetEnv(reinterpret_cast<void **>(&env), JNI_VERSION_1_8);
+    jint attachRes = 0;
+    if (ret == JNI_EDETACHED) {
+        attachRes = g_OmniStreamJVM->AttachCurrentThread(reinterpret_cast<void **>(&env), nullptr);
+    }
+    if (attachRes != JNI_OK || env == nullptr) {
+        INFO_RELEASE("Error: Failed to attach C++ thread to JVM inside CloseSavepointOutputStream");
+        throw std::runtime_error("Failed to attach C++ thread to JVM inside CloseSavepointOutputStream");
+    }
+    jclass cls = env->GetObjectClass(m_globalOmniTaskRef);
+    jmethodID mid = env->GetMethodID(cls, "closeSavepointOutputStream", "(Lorg/apache/flink/runtime/state/CheckpointStreamWithResultProvider;)Lorg/apache/flink/runtime/state/SnapshotResult;");
+    jobject javaResult = env->CallObjectMethod(m_globalOmniTaskRef, mid, provider);
+    if (env->ExceptionCheck()) {
+        env->ExceptionDescribe();
+        env->ExceptionClear();
+        env->DeleteGlobalRef(provider);
+        INFO_RELEASE("Error: Failed to call CloseSavepointOutputStream");
+        throw std::runtime_error("Failed to call CloseSavepointOutputStream");
+    }
+    auto res =  ConvertSnapshotResult(env, javaResult);
+    env->DeleteGlobalRef(provider);
+    return res;
+}
+
+void OmniTaskBridgeImpl2::WriteSavepointOutputStream(jobject provider, const int8_t *chunk, size_t offset, size_t len)
+{
+    JNIEnv* env = nullptr;
+    jint ret = g_OmniStreamJVM->GetEnv(reinterpret_cast<void **>(&env), JNI_VERSION_1_8);
+    jint attachRes = 0;
+    if (ret == JNI_EDETACHED) {
+        attachRes = g_OmniStreamJVM->AttachCurrentThread(reinterpret_cast<void **>(&env), nullptr);
+    }
+    if (attachRes != JNI_OK || env == nullptr) {
+        INFO_RELEASE("Error: Failed to attach C++ thread to JVM inside WriteSavepointOutputStream");
+        throw std::runtime_error("Failed to attach C++ thread to JVM inside WriteSavepointOutputStream");
+    }
+    jclass cls = env->GetObjectClass(m_globalOmniTaskRef);
+    jmethodID mid = env->GetMethodID(cls, "writeSavepointOutputStream", "(Lorg/apache/flink/runtime/state/CheckpointStreamWithResultProvider;[B)V");
+    jbyteArray data = env->NewByteArray(len);
+    env->SetByteArrayRegion(data, offset, len, chunk);
+    env->CallVoidMethod(m_globalOmniTaskRef, mid, provider, data);
+    if (env->ExceptionCheck()) {
+        env->ExceptionDescribe();
+        env->ExceptionClear();
+        env->DeleteLocalRef(data);
+        INFO_RELEASE("Error: Failed to call WriteSavepointOutputStream");
+        throw std::runtime_error("Failed to call WriteSavepointOutputStream");
+    }
+    env->DeleteLocalRef(data);
+}
+
+void OmniTaskBridgeImpl2::WriteSavepointMetadata(jobject provider, const std::vector<std::shared_ptr<StateMetaInfoSnapshot>>& snapshots,
+                                                 std::string keySerializer)
+{
+    JNIEnv* env = nullptr;
+    jint ret = g_OmniStreamJVM->GetEnv(reinterpret_cast<void **>(&env), JNI_VERSION_1_8);
+    jint attachRes = 0;
+    if (ret == JNI_EDETACHED) {
+        attachRes = g_OmniStreamJVM->AttachCurrentThread(reinterpret_cast<void **>(&env), nullptr);
+    }
+    if (attachRes != JNI_OK || env == nullptr) {
+        INFO_RELEASE("Error: Failed to attach C++ thread to JVM inside WriteSavepointMetadata");
+        throw std::runtime_error("Failed to attach C++ thread to JVM inside WriteSavepointMetadata");
+    }
+
+    nlohmann::json stateMetaInfoJson = nlohmann::json::array();
+    //TODO 需要增加key序列化器和namespace序列化器以保证omnistream创建的savepoint在flink可恢复
+    for (const auto& snapshot : snapshots) {
+        nlohmann::json jsonObj;
+        jsonObj["name"] = snapshot->getName();
+        jsonObj["backendStateType"] =
+        static_cast<int>(StateMetaInfoSnapshot::getCode(snapshot->getBackendStateType()));
+        jsonObj["options"] = snapshot->getOptionsImmutable();
+        jsonObj["serializer"] = snapshot->getSerializerJson();
+        jsonObj["keySerializer"] = keySerializer;
+        stateMetaInfoJson.push_back(std::move(jsonObj));
+    }
+    std::string stateMetaInfoStr = stateMetaInfoJson.dump();
+    jclass cls = env->GetObjectClass(m_globalOmniTaskRef);
+    jmethodID mid = env->GetMethodID(cls, "writeSavepointMetadata", "(Lorg/apache/flink/runtime/state/CheckpointStreamWithResultProvider;Ljava/lang/String;)V");
+    jstring jStateMetaInfoStr = env->NewStringUTF(stateMetaInfoStr.c_str());
+    env->CallVoidMethod(m_globalOmniTaskRef, mid, provider, jStateMetaInfoStr);
+    if (env->ExceptionCheck()) {
+        env->ExceptionDescribe();
+        env->ExceptionClear();
+        env->DeleteLocalRef(jStateMetaInfoStr);
+        INFO_RELEASE("Error: Failed to call WriteSavepointMetadata");
+        throw std::runtime_error("Failed to call WriteSavepointMetadata");
+    }
+    env->DeleteLocalRef(jStateMetaInfoStr);
+}
+
+long OmniTaskBridgeImpl2::GetSavepointOutputStreamPos(jobject provider)
+{
+    JNIEnv* env = nullptr;
+    jint ret = g_OmniStreamJVM->GetEnv(reinterpret_cast<void **>(&env), JNI_VERSION_1_8);
+    jint attachRes = 0;
+    if (ret == JNI_EDETACHED) {
+        attachRes = g_OmniStreamJVM->AttachCurrentThread(reinterpret_cast<void **>(&env), nullptr);
+    }
+    if (attachRes != JNI_OK || env == nullptr) {
+        INFO_RELEASE("Error: Failed to attach C++ thread to JVM inside GetSavepointOutputStreamPos");
+        throw std::runtime_error("Failed to attach C++ thread to JVM inside GetSavepointOutputStreamPos");
+    }
+    jclass cls = env->GetObjectClass(m_globalOmniTaskRef);
+    jmethodID mid = env->GetMethodID(cls, "getSavepointOutputStreamPos", "(Lorg/apache/flink/runtime/state/CheckpointStreamWithResultProvider;)J");
+    auto pos = env->CallLongMethod(m_globalOmniTaskRef, mid, provider);
+    if (env->ExceptionCheck()) {
+        env->ExceptionDescribe();
+        env->ExceptionClear();
+        env->DeleteGlobalRef(provider);
+        INFO_RELEASE("Error: Failed to call GetSavepointOutputStreamPos");
+        throw std::runtime_error("Failed to call GetSavepointOutputStreamPos");
+    }
+    return pos;
+}
+
 JNIEnv* OmniTaskBridgeImpl2::getJNIEnv()
 {
     JNIEnv* env = nullptr;

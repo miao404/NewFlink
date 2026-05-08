@@ -19,6 +19,7 @@
 #include "runtime/state/IncrementalLocalKeyedStateHandle.h"
 #include "runtime/state/filesystem/FileStateHandle.h"
 #include "runtime/checkpoint/InflightDataRescalingDescriptor.h"
+#include "runtime/state/KeyGroupsStateHandle.h"
 
 class TaskStateSnapshotSerializer {
 public:
@@ -39,6 +40,8 @@ public:
 
     static nlohmann::json parseIncrementalRemoteKeyedStateHandle(std::shared_ptr<IncrementalRemoteKeyedStateHandle> kh);
 
+    static nlohmann::json parseKeyGroupsStateHandle(std::shared_ptr<KeyGroupsStateHandle> kh);
+
     static nlohmann::json parseKeyGroupRange(KeyGroupRange keyGroupRange);
 
     static nlohmann::json parseStateHandleId(StateHandleID stateHandleID);
@@ -53,7 +56,7 @@ public:
     static nlohmann::json parseDirectoryStateHandle(DirectoryStateHandle* directoryStateHandle);
 
     static nlohmann::json parseInflightDataRescalingDescriptor(
-        const InflightDataRescalingDescriptor& rescalingDescriptor);
+        const std::shared_ptr<InflightDataRescalingDescriptor> rescalingDescriptor);
 };
 
 #endif // OMNISTREAM_TASKSTATESNAPSHOTSERIALIZER_H

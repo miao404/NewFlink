@@ -42,11 +42,12 @@ public:
         std::shared_ptr<RocksDBStateUploader> rocksDBStateUploader);
 
     std::shared_ptr<SnapshotResultSupplier<KeyedStateHandle>> asyncSnapshot(
-        SnapshotResources* snapshotResources,
+        const std::shared_ptr<SnapshotResources>& snapshotResources,
         long checkpointId,
         long timestamp,
         CheckpointStreamFactory* checkpointStreamFactory,
-        CheckpointOptions* checkpointOptions) override;
+        CheckpointOptions* checkpointOptions,
+        std::string keySerializer = "") override;
 
     void notifyCheckpointComplete(int64_t completedCheckpointId);
     void notifyCheckpointAborted(int64_t abortedCheckpointId);
@@ -69,9 +70,11 @@ private:
             std::vector<std::shared_ptr<StateMetaInfoSnapshot>> stateMetaInfoSnapshots,
             UUID backendUID,
             KeyGroupRange keyGroupRange,
-            RocksNativeFullSnapshotStrategy* outerStrategy);
+            RocksNativeFullSnapshotStrategy* outerStrategy,
+            CheckpointOptions *checkpointOptions,
+            std::shared_ptr<TypeSerializer> keySerializer);
 
-        SnapshotResult<KeyedStateHandle> *get(std::shared_ptr<omnistream::OmniTaskBridge> bridge) override;
+        std::shared_ptr<SnapshotResult<KeyedStateHandle>> get(std::shared_ptr<omnistream::OmniTaskBridge> bridge) override;
 
     private:
         int64_t uploadSnapshotFiles(
@@ -81,6 +84,7 @@ private:
         UUID backendUID_;
         KeyGroupRange keyGroupRange_;
         RocksNativeFullSnapshotStrategy* outerStrategy_;
+        CheckpointOptions *checkpointOptions_;
     };
 };
 

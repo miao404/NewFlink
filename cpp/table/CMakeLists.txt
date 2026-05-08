@@ -1,7 +1,7 @@
 # table
 cmake_minimum_required(VERSION 3.16)
 
-#find_package(xxHash CONFIG REQUIRED)
+find_package(xxHash CONFIG REQUIRED)
 
 file(GLOB_RECURSE cpp_files  ${CMAKE_CURRENT_SOURCE_DIR} "*.cpp")
 message(STATUS "All cpp files ${cpp_files}")
@@ -26,7 +26,7 @@ target_link_directories(table PUBLIC "${OMNIRUNTIME_LIB_DIR}")
 target_link_libraries(table  PRIVATE
         ${ORT_VEC_SO}
         ${ORT_CODEGEN_SO}
-#        xxHash::xxhash
+        xxHash::xxhash
 )
 target_link_libraries(table PUBLIC project_config)
 message(STATUS "${CMAKE_CXX_FLAGS}")

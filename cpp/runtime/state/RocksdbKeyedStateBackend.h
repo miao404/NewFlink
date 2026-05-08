@@ -16,6 +16,8 @@
 #include <map>
 #include <filesystem>
 #include <future>
+#include <memory>
+#include <vector>
 #include "AbstractKeyedStateBackend.h"
 #include "InternalKeyContext.h"
 #include "core/typeutils/TypeSerializer.h"
@@ -29,6 +31,10 @@
 #include "runtime/state/rocksdb/RocksdbMapState.h"
 #include "runtime/state/rocksdb/RocksdbListState.h"
 #include "runtime/state/rocksdb/RocksdbMapStateTable.h"
+#include "runtime/state/RocksDBWriteBatchWrapper.h"
+#include "runtime/state/SavepointResources.h"
+#include "runtime/state/SnapshotExecutionType.h"
+#include "runtime/state/RocksDBFullSnapshotResources.h"
 #include "RegisteredKeyValueStateBackendMetaInfo.h"
 #include "table/data/RowData.h"
 #include "table/runtime/operators/window/TimeWindow.h"
@@ -43,7 +49,7 @@
 #include "runtime/state/KeyedStateHandle.h"
 #include "runtime/state/bridge/OmniTaskBridge.h"
 #include "runtime/state/bridge/TaskStateManagerBridge.h"
-
+#include  <set>
 namespace fs = std::filesystem;
 using namespace omniruntime::type;
 /*
@@ -66,6 +72,7 @@ public:
         : AbstractKeyedStateBackend<K>(keySerializer, context), startGroup_(startGroup), endGroup_(endGroup),
           maxParallelism_(maxParallelism)
     {
+        // this constructor has been deprecated
         // 持有db实例
         kDBPath = backendHome;
         if (!(fs::exists(fs::path(kDBPath)) && fs::is_directory(fs::path(kDBPath)))) {
@@ -82,8 +89,9 @@ public:
         kDBPath = kDBPath + "/" + thread_id + "_" + std::to_string(microseconds);
 
         ROCKSDB_NAMESPACE::Options options;
+        ROCKSDB_NAMESPACE::BlockBasedTableOptions blockBasedTableOptions;
         options.create_if_missing = true;
-        DefaultConfigurableOptionsFactory::createColumnOptions(options);
+        DefaultConfigurableOptionsFactory::createColumnOptions(options, blockBasedTableOptions);
         DefaultConfigurableOptionsFactory::createDBOptions(options);
         ROCKSDB_NAMESPACE::Status s = ROCKSDB_NAMESPACE::DB::Open(options, kDBPath, &db);
         if (!s.ok()) {
@@ -93,61 +101,9 @@ public:
     // Originally used to create an internal state, not necessary here
     uintptr_t createOrUpdateInternalState(TypeSerializer *namespaceSerializer, StateDescriptor *stateDesc) override;
 
-    virtual ~RocksdbKeyedStateBackend() override
+    ~RocksdbKeyedStateBackend() override
     {
-        for (const auto& pair : registeredKvStates) {
-            StateDescriptor* desc = std::get<1>(pair.second);
-            uintptr_t stateTablePtr = std::get<0>(pair.second);
-            STD_LOG (" Join Heapkeyed Backend first " << pair.first   << "StateTable ptr " << stateTablePtr);
-            if (desc->getType() == StateDescriptor::Type::MAP) {
-                auto keyId = desc->getKeyDataId();
-                auto valueId = desc->getValueDataId();
-                if ((keyId == BackendDataType::OBJECT_BK || keyId == BackendDataType::POJO_BK) &&
-                    (valueId == BackendDataType::OBJECT_BK || valueId == BackendDataType::POJO_BK)) {
-                    auto stateTable = reinterpret_cast<RocksdbMapStateTable<K, VoidNamespace, Object*, Object*> *>(stateTablePtr);
-                    delete stateTable;
-                } else {
-                    NOT_IMPL_EXCEPTION
-                }
-            } else if (desc->getType() == StateDescriptor::Type::VALUE) {
-                auto dataId = desc->getBackendId();
-                if (dataId == BackendDataType::OBJECT_BK || dataId == BackendDataType::POJO_BK) {
-                    auto stateTable = reinterpret_cast<RocksdbStateTable<K, VoidNamespace, Object*> *>(stateTablePtr);
-                    delete stateTable;
-                } else {
-                    NOT_IMPL_EXCEPTION
-                }
-            } else if (desc->getType() == StateDescriptor::Type::LIST) {
-                auto dataId = desc->getBackendId();
-                if (dataId == BackendDataType::BIGINT_BK) {
-                    auto stateTable = reinterpret_cast<RocksdbStateTable<K, VoidNamespace, std::vector<int64_t>*> *>(stateTablePtr);
-                    delete stateTable;
-                } else {
-                    NOT_IMPL_EXCEPTION
-                }
-            }
-            delete desc;
-        }
-        registeredKvStates.clear();
-
-        for (const auto& pair : createdKvState) {
-            auto *state = reinterpret_cast<State *>(pair.second);
-            delete state;
-        }
-        createdKvState.clear();
-
-        // close
-        db->Close();
-        // clear path
-        std::error_code ec;
-        // 直接使用remove_all删除整个目录树
-        std::filesystem::remove_all(kDBPath, ec);
-        // 如果ec有错误，则删除失败
-        if (ec) {
-            std::cerr << "删除失败: " << ec.message() << std::endl;
-        }
-
-        delete db;
+        RocksdbKeyedStateBackend<K>::dispose();
     };
 
     RocksdbKeyedStateBackend(
@@ -159,6 +115,7 @@ public:
         std::unordered_map<std::string, std::shared_ptr<RocksDbKvStateInfo>> *kvStateInformation,
         std::shared_ptr<ResourceGuard> rocksDBResourceGuard,
         int keyGroupPrefixBytes,
+        std::shared_ptr<RocksDBWriteBatchWrapper> writeBatchWrapper,
         std::shared_ptr<TaskStateManagerBridge> bridge,
         std::shared_ptr<omnistream::OmniTaskBridge> omniTaskBridge)
         : AbstractKeyedStateBackend<K>(keySerializer, context),
@@ -169,6 +126,7 @@ public:
         keyGroupRange_(keyGroupRange),
         keySerializer_(keySerializer),
         keyGroupPrefixBytes_(keyGroupPrefixBytes),
+        writeBatchWrapper_(writeBatchWrapper),
         bridge_(bridge),
         omniTaskBridge_(omniTaskBridge)
     {
@@ -177,17 +135,20 @@ public:
         maxParallelism_ = keyGroupRange->getNumberOfKeyGroups();
     }
 
-    std::shared_ptr<std::packaged_task<SnapshotResult<KeyedStateHandle>*()>> snapshot(
+    std::shared_ptr<std::packaged_task<std::shared_ptr<SnapshotResult<KeyedStateHandle>>()>> snapshot(
             long checkpointId,
             long timestamp,
             CheckpointStreamFactory* streamFactory,
             CheckpointOptions* options)
     {
+        flushFalconCacheBeforeCheckpoint(); // [FALCON] flush falcon cache before snapshot
+
         auto snapshotstrategyrunner = std::make_unique<SnapshotStrategyRunner<KeyedStateHandle, SnapshotResources>>(
             strategy->getDescription(),
             strategy,
             SnapshotExecutionType::ASYNCHRONOUS);
-        return snapshotstrategyrunner->snapshot(checkpointId, timestamp, streamFactory, options, omniTaskBridge_);
+        return snapshotstrategyrunner->snapshot(checkpointId, timestamp, streamFactory, options, omniTaskBridge_,
+                                                keySerializer_->toJson());
     }
 
     void notifyCheckpointComplete(long completedCheckpointId)
@@ -196,18 +157,139 @@ public:
             strategy->notifyCheckpointComplete(completedCheckpointId);
         }
     }
+    std::shared_ptr<SavepointResources> savepoint() override
+    {
+        flushFalconCacheBeforeCheckpoint(); // [FALCON] flush falcon cache before savepoint
+
+        writeBatchWrapper_->Flush();
+        auto snapshotResources = RocksDBFullSnapshotResources::create(
+            *kvStateInformation_,
+            db,
+            rocksDBResourceGuard_,
+            keyGroupRange_,
+            keySerializer_,
+            keyGroupPrefixBytes_);
+        return std::make_shared<SavepointResources>(snapshotResources, SnapshotExecutionType::ASYNCHRONOUS);
+    }
+
+    void dispose() override {
+        if (disposed_) {
+            return;
+        }
+        INFO_RELEASE("Start to dispose RocksDB Keyed State Backend.");
+        AbstractKeyedStateBackend<K>::dispose();
+        rocksDBResourceGuard_->close();
+
+        if (db != nullptr) {
+            for (const auto& pair : registeredKvStates) {
+                StateDescriptor* desc = std::get<1>(pair.second);
+                uintptr_t stateTablePtr = std::get<0>(pair.second);
+                BackendDataType nsId = std::get<2>(pair.second);
+
+                if (desc->getType() == StateDescriptor::Type::MAP) {
+                    auto keyId = desc->getKeyDataId();
+                    auto valueId = desc->getValueDataId();
+                    // MAP state 目前只支持 VoidNamespace
+                    if (keyId == BackendDataType::INT_BK && valueId == BackendDataType::INT_BK) {
+                        delete reinterpret_cast<RocksdbMapStateTable<K, VoidNamespace, int32_t, int32_t>*>(stateTablePtr);
+                    } else if (keyId == BackendDataType::BIGINT_BK && valueId == BackendDataType::BIGINT_BK) {
+                        delete reinterpret_cast<RocksdbMapStateTable<K, VoidNamespace, int64_t, int64_t>*>(stateTablePtr);
+                    } else if (keyId == BackendDataType::VARCHAR_BK && valueId == BackendDataType::INT_BK) {
+                        delete reinterpret_cast<RocksdbMapStateTable<K, VoidNamespace, std::string, int32_t>*>(stateTablePtr);
+                    } else if (keyId == BackendDataType::ROW_BK && valueId == BackendDataType::INT_BK) {
+                        delete reinterpret_cast<RocksdbMapStateTable<K, VoidNamespace, RowData*, int32_t>*>(stateTablePtr);
+                    } else if (keyId == BackendDataType::ROW_BK && valueId == BackendDataType::ROW_BK) {
+                        delete reinterpret_cast<RocksdbMapStateTable<K, VoidNamespace, RowData*, RowData*>*>(stateTablePtr);
+                    } else if (keyId == BackendDataType::XXHASH128_BK && valueId == BackendDataType::TUPLE_INT32_INT64) {
+                        delete reinterpret_cast<RocksdbMapStateTable<K, VoidNamespace, XXH128_hash_t, std::tuple<int32_t, int64_t>>*>(stateTablePtr);
+                    } else if (keyId == BackendDataType::XXHASH128_BK && valueId == BackendDataType::TUPLE_INT32_INT32_INT64) {
+                        delete reinterpret_cast<RocksdbMapStateTable<K, VoidNamespace, XXH128_hash_t, std::tuple<int32_t, int32_t, int64_t>>*>(stateTablePtr);
+                    } else if (keyId == BackendDataType::TIME_WINDOW_BK && valueId == BackendDataType::TIME_WINDOW_BK) {
+                        delete reinterpret_cast<RocksdbMapStateTable<K, VoidNamespace, TimeWindow, TimeWindow>*>(stateTablePtr);
+                    } else if (keyId == BackendDataType::ROW_BK && valueId == BackendDataType::ROW_LIST_BK) {
+                        delete reinterpret_cast<RocksdbMapStateTable<K, VoidNamespace, RowData*, std::vector<RowData*>*>*>(stateTablePtr);
+                    } else if ((keyId == BackendDataType::VARCHAR_BK && valueId == BackendDataType::BIGINT_BK) ||
+                               (keyId == BackendDataType::OBJECT_BK && valueId == BackendDataType::POJO_BK) ||
+                               (keyId == BackendDataType::OBJECT_BK && valueId == BackendDataType::OBJECT_BK)) {
+                        delete reinterpret_cast<RocksdbMapStateTable<K, VoidNamespace, Object*, Object*>*>(stateTablePtr);
+                    } else {
+                        GErrorLog("Unhandled MAP state type in dispose: keyId=" + std::to_string((int)keyId) + " valueId=" + std::to_string((int)valueId));
+                    }
+
+                } else if (desc->getType() == StateDescriptor::Type::VALUE) {
+                    auto dataId = desc->getBackendId();
+                    if (dataId == BackendDataType::ROW_BK) {
+                        // namespace 可能是 int64_t, TimeWindow, 或 VoidNamespace
+                        if (nsId == BackendDataType::BIGINT_BK) {
+                            delete reinterpret_cast<RocksdbStateTable<K, int64_t, RowData*>*>(stateTablePtr);
+                        } else if (nsId == BackendDataType::TIME_WINDOW_BK) {
+                            delete reinterpret_cast<RocksdbStateTable<K, TimeWindow, RowData*>*>(stateTablePtr);
+                        } else {
+                            delete reinterpret_cast<RocksdbStateTable<K, VoidNamespace, RowData*>*>(stateTablePtr);
+                        }
+                    } else if (dataId == BackendDataType::INT_BK) {
+                        delete reinterpret_cast<RocksdbStateTable<K, VoidNamespace, int32_t>*>(stateTablePtr);
+                    } else if (dataId == BackendDataType::BIGINT_BK) {
+                        delete reinterpret_cast<RocksdbStateTable<K, VoidNamespace, int64_t>*>(stateTablePtr);
+                    } else if (dataId == BackendDataType::OBJECT_BK || dataId == BackendDataType::POJO_BK) {
+                        delete reinterpret_cast<RocksdbStateTable<K, VoidNamespace, Object*>*>(stateTablePtr);
+                    } else {
+                        GErrorLog("Unhandled VALUE state type in dispose: dataId=" + std::to_string((int)dataId));
+                    }
+
+                } else if (desc->getType() == StateDescriptor::Type::LIST) {
+                    auto dataId = desc->getBackendId();
+                    if (dataId == BackendDataType::BIGINT_BK) {
+                        if (nsId == BackendDataType::BIGINT_BK) {
+                            // createOrUpdateInternalListState<int64_t, int64_t> 注册的是 RocksdbStateTable<K, int64_t, int64_t>
+                            delete reinterpret_cast<RocksdbStateTable<K, int64_t, int64_t>*>(stateTablePtr);
+                        } else {
+                            // createOrUpdateInternalListState<VoidNamespace, int64_t>
+                            delete reinterpret_cast<RocksdbStateTable<K, VoidNamespace, int64_t>*>(stateTablePtr);
+                        }
+                    } else {
+                        GErrorLog("Unhandled LIST state type in dispose: dataId=" + std::to_string((int)dataId));
+                    }
+                }
+                delete desc;
+            }
+            registeredKvStates.clear();
+
+            for (const auto& pair : createdKvState) {
+                auto *state = reinterpret_cast<State *>(pair.second);
+                delete state;
+                state = nullptr;
+            }
+            createdKvState.clear();
+
+            db->Close();
+
+            INFO_RELEASE("Cleaning up RocksDB working directory " << kDBPath)
+            std::error_code ec;
+            std::filesystem::remove_all(kDBPath, ec);
+            if (ec) {
+                GErrorLog("Could not delete RocksDB working directory " + kDBPath + ", error message = " + ec.message().c_str());
+            }
+            INFO_RELEASE("RocksDB Keyed State Backend has been disposed.")
+            delete db;
+            db = nullptr;
+        }
+        disposed_ = true;
+    }
 
 private:
     int startGroup_;
     int endGroup_;
     int maxParallelism_;
-    ROCKSDB_NAMESPACE::DB* db;
+    ROCKSDB_NAMESPACE::DB* db = nullptr;
+    bool disposed_ = false; // mark whether the backend is already disposed and prevent duplicate disposing
+    std::shared_ptr<RocksDBWriteBatchWrapper> writeBatchWrapper_;
     std::string kDBPath;
     RocksDBSnapshotStrategyBase* strategy;
     std::unordered_map<std::string, std::shared_ptr<RocksDbKvStateInfo>> *kvStateInformation_;
     std::shared_ptr<ResourceGuard> rocksDBResourceGuard_;
-    KeyGroupRange* keyGroupRange_;
-    TypeSerializer* keySerializer_;
+    KeyGroupRange* keyGroupRange_ = nullptr;
+    TypeSerializer* keySerializer_ = nullptr;
     int keyGroupPrefixBytes_;
     std::shared_ptr<TaskStateManagerBridge> bridge_;
     std::shared_ptr<omnistream::OmniTaskBridge> omniTaskBridge_;
@@ -219,9 +301,14 @@ private:
     RocksdbMapStateTable<K, N, UK, UV> *tryRegisterMapStateTable(TypeSerializer *namespaceSerializer,
                                                                  MapStateDescriptor<UK, UV> *stateDesc);
     // pointer to StateTable<K, N, V>
-    emhash7::HashMap<std::string, std::tuple<uintptr_t, StateDescriptor*>> registeredKvStates;
+    emhash7::HashMap<std::string, std::tuple<uintptr_t, StateDescriptor*, BackendDataType>> registeredKvStates;
     // pointer to intervalKvState
     emhash7::HashMap<std::string, uintptr_t> createdKvState;
+    // [FALCON] pointer to intervalKvState that enable falcon cache
+    emhash7::HashMap<std::string, uintptr_t> falconKvState = {};
+
+    // [FALCON] flush falcon cache before savepoint and snapshot
+    void flushFalconCacheBeforeCheckpoint();
 
     template <typename N, typename UK, typename UV>
     RocksdbMapState<K, N, UK, UV> *createOrUpdateInternalMapState(
@@ -247,6 +334,22 @@ private:
     void registerKvStateInformation(StateDescriptor *stateDesc, TypeSerializer *namespaceSerializer,
                                     TypeSerializer *stateSerializer);
 };
+
+template <typename K>
+void RocksdbKeyedStateBackend<K>::flushFalconCacheBeforeCheckpoint()
+{
+    // If falcon cache is disabled, falconKvState is empty, this function will do nothing.
+    // Note that, in current version, falcon cache is always enabled. But for sql cases, omniStream will revert to raw
+    // Flink. Thus, this function will always be called in dataStream case, which means K and V are all Object* type,
+    // and N is VoidNamespace type.
+    for (auto &entry : falconKvState) {
+        auto* state = reinterpret_cast<RocksdbValueState<Object *, VoidNamespace, Object *> *>(entry.second);
+        if (state != nullptr && state->stateCache != nullptr) {
+            state->stateCache->flush();
+            state->stateCache->clearAll();
+        }
+    }
+}
 
 template <typename K>
 uintptr_t RocksdbKeyedStateBackend<K>::createOrUpdateInternalState(TypeSerializer *namespaceSerializer,
@@ -341,6 +444,8 @@ uintptr_t RocksdbKeyedStateBackend<K>::GetValueState(TypeSerializer *namespaceSe
         return (uintptr_t) createOrUpdateInternalValueState<VoidNamespace, int64_t>(namespaceSerializer, stateDesc);
     } else if (dataId == BackendDataType::POJO_BK || dataId == BackendDataType::OBJECT_BK) {
         return (uintptr_t) createOrUpdateInternalValueState<VoidNamespace, Object*>(namespaceSerializer, stateDesc);
+    }else if (dataId == BackendDataType::SET_LONG) {
+        return (uintptr_t) createOrUpdateInternalValueState<VoidNamespace, std::vector<long>*>(namespaceSerializer, stateDesc);
     } else {
         NOT_IMPL_EXCEPTION
     }
@@ -396,12 +501,17 @@ RocksdbStateTable<K, N, S> *RocksdbKeyedStateBackend<K>::tryRegisterStateTable(T
         stateTable->setMetaInfo(std::move(restoredKvMetaInfo));
         return stateTable;
     } else {
-        std::unique_ptr<RegisteredKeyValueStateBackendMetaInfo> newMetaInfo =
-                std::make_unique<RegisteredKeyValueStateBackendMetaInfo>(stateDesc->getName(), namespaceSerializer,
-                                                           newStateSerializer);
+        std::unique_ptr<RegisteredKeyValueStateBackendMetaInfo> newMetaInfo = nullptr;
+		if (stateDesc->getType() == StateDescriptor::Type::VALUE) {
+			newMetaInfo = std::make_unique<RegisteredKeyValueStateBackendMetaInfo>(stateDesc->getType(),
+				stateDesc->getName(), namespaceSerializer, newStateSerializer);
+		} else {
+			newMetaInfo = std::make_unique<RegisteredKeyValueStateBackendMetaInfo>(stateDesc->getName(),
+				namespaceSerializer, newStateSerializer);
+		}
         RocksdbStateTable<K, N, S> *stateTable =
                 new RocksdbStateTable<K, N, S>(this->context, std::move(newMetaInfo), this->keySerializer);
-        std::tuple tuple(reinterpret_cast<uintptr_t>(stateTable), stateDesc);
+        std::tuple tuple(reinterpret_cast<uintptr_t>(stateTable), stateDesc, namespaceSerializer->getBackendId());
         registeredKvStates[stateDesc->getName()] = tuple;
         return stateTable;
     }
@@ -423,12 +533,12 @@ RocksdbMapStateTable<K, N, UK, UV> *RocksdbKeyedStateBackend<K>::tryRegisterMapS
         return stateTable;
     } else {
         std::unique_ptr<RegisteredKeyValueStateBackendMetaInfo> newMetaInfo =
-                std::make_unique<RegisteredKeyValueStateBackendMetaInfo>(stateDesc->getName(), namespaceSerializer,
-                                                           newStateSerializer);
+			std::make_unique<RegisteredKeyValueStateBackendMetaInfo>(stateDesc->getName(), namespaceSerializer,
+																	 newStateSerializer);
         RocksdbMapStateTable<K, N, UK, UV> *stateTable =
                 new RocksdbMapStateTable<K, N, UK, UV>(this->context, std::move(newMetaInfo), this->keySerializer,
                                                        stateDesc->GetUserKeySerializer());
-        std::tuple tuple(reinterpret_cast<uintptr_t>(stateTable), stateDesc);
+        std::tuple tuple(reinterpret_cast<uintptr_t>(stateTable), stateDesc, namespaceSerializer->getBackendId());
         registeredKvStates[stateDesc->getName()] = tuple;
         return stateTable;
     }
@@ -452,6 +562,23 @@ RocksdbValueState<K, N, V> *RocksdbKeyedStateBackend<K>::createOrUpdateInternalV
     }
     createdKvState[stateDesc->getName()] = reinterpret_cast<uintptr_t>(createdState);
     createdState->createTable(db, stateDesc->getName(), kvStateInformation_);
+
+    // [FALCON] -------------------------------------------------------------------------------------------
+    // todo: ttl state is not implemented in omniStream, thus falcon does not check it
+    // store the reference of all the created value states, all of them enable falcon cache
+    falconKvState[stateDesc->getName()] = reinterpret_cast<uintptr_t>(createdState);
+    INFO_RELEASE("[FALCON] <" << stateDesc->getName() << ", ValueState> enable falcon cache.\n")
+    // after this state is created, update cache size limit for all the created states who use falcon cache.
+    int newCacheSize = 3000 / falconKvState.size();
+    INFO_RELEASE("[FALCON] update falcon cache size to " << newCacheSize << ".\n")
+    for (auto &entry : falconKvState) {
+        auto* state = reinterpret_cast<RocksdbValueState<K, N, V> *>(entry.second);
+        if (state != nullptr && state->stateCache != nullptr) {
+            state->stateCache->updateSizeLimit(newCacheSize);
+        }
+    }
+    // [FALCON] -------------------------------------------------------------------------------------------
+
     return createdState;
 }
 
@@ -474,6 +601,7 @@ RocksdbMapState<K, N, UK, UV> *RocksdbKeyedStateBackend<K>::createOrUpdateIntern
     }
     createdKvState[stateDesc->getName()] = reinterpret_cast<uintptr_t>(createdState);
     createdState->createTable(db, stateDesc->getName(), kvStateInformation_);
+    createdState->setMaxParallelism(maxParallelism_);
     return createdState;
 }
 

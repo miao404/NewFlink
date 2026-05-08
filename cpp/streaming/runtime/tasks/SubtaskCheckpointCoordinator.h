@@ -30,13 +30,15 @@ namespace omnistream {
          */
         virtual void InitInputsCheckpoint(long id, CheckpointOptions *checkpointOptions) = 0;
 
+        virtual std::shared_ptr<ChannelStateWriter> getChannelStateWriter() = 0;
+
         virtual void checkpointState(
                 CheckpointMetaData *metadata,
                 CheckpointOptions *options,
                 CheckpointMetricsBuilder *metrics,
                 omnistream::OperatorChainV2 *operatorChain,
                 bool isTaskFinished,
-                omnistream::Supplier<bool> *isRunning
+                std::shared_ptr<omnistream::Supplier<bool>> isRunning
         ) {};
     };
 }

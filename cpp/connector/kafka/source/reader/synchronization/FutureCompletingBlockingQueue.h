@@ -141,7 +141,7 @@ private:
         std::shared_ptr<omnistream::CompletableFuture> current = currentFuture;
         if (current != AVAILABLE) {
             currentFuture = AVAILABLE;
-            current->setCompleted();
+            current->complete();
         }
     }
 
@@ -213,9 +213,7 @@ private:
         maybeCreateCondition(threadIndex);
         notFull.push(&putConditionAndFlags[threadIndex]->cond);
         // Use wait with predicate to handle spurious wakeups
-        putConditionAndFlags[threadIndex]->cond.wait(lk, [this, threadIndex]() {
-            return !putConditionAndFlags[threadIndex]->wakeUp;
-        });
+        putConditionAndFlags[threadIndex]->cond.wait(lk);
     }
 };
 

@@ -15,6 +15,9 @@
 #include "streaming/runtime/io/OmniStreamTaskSourceInput.h"
 
 namespace omnistream {
+
+    const int DATASTREAM_TASK_TYPE = 2;
+
     void omnistream::OmniSourceOperatorStreamTask::init()
     {
         OmniStreamTask::init();
@@ -22,10 +25,10 @@ namespace omnistream {
         auto output = createDataOutput();
         auto input = createTaskInput();
 
-        inputProcessor_ = std::make_shared<OmniStreamOneInputProcessor>(input, output, operatorChain);
+        inputProcessor_ = new OmniStreamOneInputProcessor(input, output, operatorChain.get());
     }
 
-    void omnistream::OmniSourceOperatorStreamTask::processInput(std::shared_ptr<MailboxDefaultAction::Controller> controller)
+    void omnistream::OmniSourceOperatorStreamTask::processInput(MailboxDefaultAction::Controller *controller)
     {
         OmniStreamTask::processInput(controller);
     }
@@ -37,7 +40,11 @@ namespace omnistream {
 
     OmniPushingAsyncDataInput::OmniDataOutput *OmniSourceOperatorStreamTask::createDataOutput()
     {
-        return new OmniAsyncDataOutputToOutput(operatorChain->GetMainOperatorOutput(), false);
+        bool isDataStream = false;
+        if (taskType == DATASTREAM_TASK_TYPE) {
+            isDataStream = true;
+        }
+        return new OmniAsyncDataOutputToOutput(operatorChain->GetMainOperatorOutput(), isDataStream);
     }
 
 

@@ -65,13 +65,12 @@ public class RemoteDataFetcher implements Runnable {
     public void run() {
         Thread.currentThread().setName("RemoteDataFetcher-----> for task: " + taskName);
         registerRemoteDataFetcherToNative(nativeTaskRef);
-        startRecycleBuffersThreadForRemote();
         buildRemoteConnection();
         while (running) {
             try {
                 boolean hasDataSent = sendData();
                 if (!hasDataSent) {
-                    Thread.sleep(100);
+                    Thread.sleep(10);
                 }
             } catch (InterruptedException e) {
                 LOG.error("Error sleeping", e);
@@ -158,14 +157,16 @@ public class RemoteDataFetcher implements Runnable {
                             MemorySegment eventMemorySegment = MemorySegmentFactory.wrapOffHeapMemory(byteBuffer);
                             EventBuffer eventBuffer = new EventBuffer(eventMemorySegment);
                             buffer = eventBuffer;
+                            LOG.info("Notify remote event buffer available, buffer address: {}, buffer class: {}, buffer type: {}",
+                                    buffer.getMemorySegment().getAddress(), buffer.getClass().getSimpleName(), buffer.getDataType().toString());
                         }
                         long bufferAddress = buffer.getMemorySegment().getAddress();
                         int readIndex = buffer.getReaderIndex();
-                        
+
+                        waitingForRecycleBuffers.put(bufferAddress, buffer);
                         this.notifyRemoteDataAvailable(nativeTaskRef, inputGateIndex, channelIndex, bufferAddress,
                                 bufferLength, readIndex,sequenceNumber, isBuffer, bufferType);
-                        
-                        recycleBuffer(bufferAddress, buffer);
+
                         hasData = true;
                     }
                 } catch (IOException | RuntimeException | InterruptedException e) {
@@ -176,14 +177,7 @@ public class RemoteDataFetcher implements Runnable {
         }
         return hasData;
     }
-    
-    public void recycleBuffer(long address, Buffer buffer) {
-        if (!(buffer instanceof EventBuffer)) {
-            buffer.recycleBuffer();
-        } else {
-            waitingForRecycleBuffers.put(address, buffer);
-        }
-    }
+
     public List<OmniRemoteInputChannel> getRemoteInputChannels() {
         return remoteInputChannels;
     }
@@ -198,20 +192,24 @@ public class RemoteDataFetcher implements Runnable {
     class BufferRecyclingRunnable implements Runnable {
         @Override
         public void run() {
+            Thread.currentThread().setName("RemoteDataFetcher - BufferRecycler -----> for task: " + taskName);
             try {
                 while (running) {
                     long address = getRecycleBufferAddress(nativeTaskRef);
                     if (address != -1) {
                         Buffer buffer = waitingForRecycleBuffers.remove(address);
                         if (buffer != null) {
-                            LOG.info("Recycling buffer with address: {}", address);
                             buffer.recycleBuffer();
+                            LOG.debug("Buffer has been recycled, buffer address: {}, buffer clazz: {}, buffer type: {}, " +
+                                            "size of buffers waiting to be recycled: {}",
+                                    address, buffer.getClass().getSimpleName(),
+                                    buffer.getDataType().toString(), waitingForRecycleBuffers.size());
                         } else {
                             if (address == -9999) {
                                 LOG.info("Received special address -9999, indicating no buffer to recycle.");
                                 break;
                             }
-                            LOG.warn("No buffer found for address: {}", address);
+                            LOG.error("No buffer found for address: {}", address);
                         }
                     }
                 }
@@ -261,7 +259,7 @@ public class RemoteDataFetcher implements Runnable {
      * @param sequenceNumber sequenceNumber
      */
     public native void notifyRemoteDataAvailable(long nativeTaskRef, int inputGateIndex, int channelIndex,
-            long bufferAddress, int bufferLength, int readIndex,int sequenceNumber, boolean isBuffer,int bufferType);
+            long bufferAddress, int bufferLength, int readIndex, int sequenceNumber, boolean isBuffer, int bufferType);
     
     public native long getRecycleBufferAddress(long nativeTaskRef);
 

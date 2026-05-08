@@ -22,7 +22,7 @@ public:
     PlaceholderStreamStateHandle(std::unique_ptr<PhysicalStateHandleID> physicalID, int64_t stateSize)
         : physicalID(std::move(physicalID)), stateSize(stateSize) {}
 
-    std::unique_ptr<FSDataInputStream> OpenInputStream() const override
+    std::shared_ptr<FSDataInputStream> OpenInputStream() const override
     {
         throw std::runtime_error(
             "This is only a placeholder to be replaced by a real StreamStateHandle in the checkpoint coordinator.");
@@ -37,6 +37,11 @@ public:
     std::unique_ptr<PhysicalStateHandleID> GetStreamStateHandleID()
     {
         return std::move(physicalID);
+    }
+
+    std::string GetStreamStateHandleIDKeyString()
+    {
+        return physicalID->getKeyString();
     }
 
     PhysicalStateHandleID GetStreamStateHandleID() const override

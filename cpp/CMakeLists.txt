@@ -9,7 +9,7 @@ set(CMAKE_CXX_STANDARD 17)
 if(DEFINED ENV{OMNI_HOME})
     set(CMAKE_INSTALL_PREFIX $ENV{OMNI_HOME} CACHE PATH "Install path prefix" FORCE)
 endif()
-option(WITH_OMNISTATESTORE "Enable to build with OmniStateStore" OFF)
+option(WITH_OMNISTATESTORE "Enable to build with OmniStateStore" ON)
 add_library(project_config INTERFACE)
 if(WITH_OMNISTATESTORE)
     target_compile_definitions(project_config INTERFACE WITH_OMNISTATESTORE)
@@ -75,11 +75,11 @@ endif ()
 ###########################
 ##### require JAVA_HOME ####
 
-#find_package(JNI REQUIRED)
+find_package(JNI REQUIRED)
 
-#find_library(JEMALLOC_LIB jemalloc)
+find_library(JEMALLOC_LIB jemalloc)
 # Optional
-#find_path(JEMALLOC_INCLUDE_DIR jemalloc/jemalloc.h)
+find_path(JEMALLOC_INCLUDE_DIR jemalloc/jemalloc.h)
 
 set (JEMALLOC_LIB "")
 if (JEMALLOC_LIB)
@@ -102,7 +102,7 @@ endif()
 # Find LLVM
 # Please set path to your LLVM-description.cmake for cmake to find it
 # set(LLVM_DIR "/home/xichen/opt/llvm-project/build/lib/cmake/llvm")
-#find_package(LLVM REQUIRED CONFIG)
+find_package(LLVM REQUIRED CONFIG)
 include_directories(${LLVM_INCLUDE_DIRS})
 link_directories("${LLVM_INCLUDE_DIRS}/../lib")
 
@@ -149,6 +149,7 @@ endif()
 set(CMAKE_SKIP_RPATH TRUE)
 set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS} -lrt -fno-var-tracking-assignments -pipe -g -Wall -fPIC -fno-omit-frame-pointer -fno-common -fno-stack-protector")
 set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS} -lrt -fno-var-tracking-assignments -Wno-terminate -Wno-delete-incomplete -pipe -Wall -Wno-strict-aliasing -Wtrampolines -D_FORTIFY_SOURCE=2 -fPIC -finline-functions -fstack-protector-strong -s -Wl,-z,noexecstack -Wl,-z,relro,-z,now -finline-limit=6000 --param inline-unit-growth=300")
+add_compile_options("-march=armv8-a+sve")
 
 # Default including directory
 include_directories("${CMAKE_CURRENT_SOURCE_DIR}/core/include/" "${CMAKE_CURRENT_SOURCE_DIR}"
@@ -179,8 +180,6 @@ else()
     set(OMNIRUNTIME_SRC_DIR "${OMNIRUNTIME_DIR}")
 endif()
 
-set(OMNIRUNTIME_LIB_DIR "M:/Users/z00851215/code")
-set(OMNIRUNTIME_SRC_DIR "M:/Users/z00851215/code")
 include_directories("${OMNIRUNTIME_SRC_DIR}/")
 include_directories("${OMNIRUNTIME_SRC_DIR}/OmniOperatorJIT/")
 include_directories("${OMNIRUNTIME_SRC_DIR}/OmniOperatorJIT/core")
@@ -194,9 +193,9 @@ if(ENABLE_ORT_1_7)
     set(ORT_CODEGEN_SO boostkit-omniop-codegen-1.7.0-aarch64)
     set(ORT_OP_SO boostkit-omniop-operator-1.7.0-aarch64)
 else ()
-    set(ORT_VEC_SO boostkit-omniop-vector-1.9.0-aarch64)
-    set(ORT_CODEGEN_SO boostkit-omniop-codegen-1.9.0-aarch64)
-    set(ORT_OP_SO boostkit-omniop-operator-1.9.0-aarch64)    
+    set(ORT_VEC_SO boostkit-omniop-vector-2.1.0-aarch64)
+    set(ORT_CODEGEN_SO boostkit-omniop-codegen-2.1.0-aarch64)
+    set(ORT_OP_SO boostkit-omniop-operator-2.1.0-aarch64)
 endif()
 
 option(ENABLE_TSHOOT "Enable trouble shooting macro" OFF)
@@ -226,7 +225,7 @@ add_subdirectory(connector)
 # add_subdirectory(codegen)
 # add_subdirectory(expression)
 
-option(ENABLE_TESTS "Provide unit tests" OFF)
+option(ENABLE_TESTS "Provide unit tests" ON)
 if (ENABLE_TESTS)
     add_subdirectory(test)
 endif ()
@@ -234,7 +233,3 @@ endif ()
 enable_testing()
 
 message(STATUS "Compiler options: ${CMAKE_CXX_FLAGS}")
-
-
-
-

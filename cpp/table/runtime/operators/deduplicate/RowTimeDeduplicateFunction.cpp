@@ -45,8 +45,10 @@ unordered_map<RowData *, long> RowTimeDeduplicateFunction::getUpdateState(
 {
     unordered_map<RowData *, long> tmpState;
     int curBatchId = getCurrentBatchId() - 1;
+    long* comboIDs = new long[rowCount];
+    VectorBatchUtil::getComboId_sve(curBatchId, rowCount, comboIDs);
     for (int i = 0; i < rowCount; i++) {
-        long comboId = VectorBatchUtil::getComboId(curBatchId, i);
+        long comboId = comboIDs[i];
 
         // 建立key
         RowData *key = groupByKeySelector->getKey(inputVB, i);
@@ -63,11 +65,12 @@ unordered_map<RowData *, long> RowTimeDeduplicateFunction::getUpdateState(
         } else if (itTmp != tmpState.end()) {
             long curComboId = itTmp->second;
             if (isDuplicate(curComboId, comboId)) {
-                itTmp->second = comboId;
+                tmpState[key] = comboId;
             }
             delete key;
         }
     }
+    delete[] comboIDs;
     return tmpState;
 }
 
@@ -196,11 +199,12 @@ void RowTimeDeduplicateFunction::open(const Configuration &config)
 
     this->recordStateVB =
             static_cast<StreamingRuntimeContext<RowData *> *>(getRuntimeContext())->getState<int64_t>(recordStateDesc);
-    static_cast<HeapValueState<RowData *, VoidNamespace, int64_t> *>(this->recordStateVB)->setDefaultValue(-1);
     if (dynamic_cast<RocksdbValueState<RowData *, VoidNamespace, int64_t> *>(recordStateVB)) {
+        static_cast<RocksdbValueState<RowData *, VoidNamespace, int64_t> *>(this->recordStateVB)->setDefaultValue(-1);
         INFO_RELEASE("RowTimeDeduplicateFunction backend is rocksdb")
         backendType = 1;
     } else {
+        static_cast<HeapValueState<RowData *, VoidNamespace, int64_t> *>(this->recordStateVB)->setDefaultValue(-1);
         INFO_RELEASE("RowTimeDeduplicateFunction backend is mem")
         backendType = 0;
     }

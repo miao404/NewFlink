@@ -148,6 +148,10 @@ public class OmniCreditBasedSequenceNumberingViewReader
                 LOG.info("requestSubpartitionView for task: {} ## {}", taskName.substring(0, 15), subPartitionIndex);
                 nativeCreditBasedSequenceNumberingViewReaderRef = createNativeCreditBasedSequenceNumberingViewReader(
                         nativeTaskRef, statusAddress, partitionId, subPartitionIndex);
+                if (nativeCreditBasedSequenceNumberingViewReaderRef == -1) {
+                    LOG.error("create nativeCreditBasedSequenceNumberingViewReader failed");
+                    throw new PartitionNotFoundException(resultPartitionId);
+                }
                 LOG.info("requestSubpartitionView for task: {} ## {} create result = {},{}",
                         taskName.substring(0, 15),
                         subPartitionIndex, nativeCreditBasedSequenceNumberingViewReaderRef,
@@ -196,7 +200,7 @@ public class OmniCreditBasedSequenceNumberingViewReader
                 if (nativeCreditBasedSequenceNumberingViewReaderRef != -1) {
                     if (!flushed && (numCreditsAvailable - bufferInfos.size()) > 0) {
                         int res = checkIfDataAvailableAndNotifyNetty();
-                        LOG.info("nativeCreditBasedSequenceNumberingViewReaderRef can flush: " + "{} ## {},"
+                        LOG.debug("nativeCreditBasedSequenceNumberingViewReaderRef can flush: " + "{} ## {},"
                                 + " got " + "data" + " size = {} and numCreditsAvailable = {},native ref = "
                                 + "{}", taskName.substring(0, 15), subPartitionIndex, res,
                                 numCreditsAvailable, nativeCreditBasedSequenceNumberingViewReaderRef);
@@ -206,7 +210,7 @@ public class OmniCreditBasedSequenceNumberingViewReader
                     } else {
                         count++;
                         if (count % 500 == 0) {
-                            LOG.info("nativeCreditBasedSequenceNumberingViewReaderRef can not flush: {} "
+                            LOG.debug("nativeCreditBasedSequenceNumberingViewReaderRef can not flush: {} "
                                     + "##{}, numCreditsAvailable = {}, bufferInfos size = {} and "
                                     + "flushed= {} and native " + "ref = {}", taskName.substring(0,
                                     15), subPartitionIndex, numCreditsAvailable, bufferInfos.size(),
@@ -250,6 +254,7 @@ public class OmniCreditBasedSequenceNumberingViewReader
     /**
      * notifyDataAvailable
      */
+    @Override
     public void notifyDataAvailable() {
         LOG.info("Thread = {} do nothing notifyDataAvailable for task: {} ## {} and native red = {}",
                 Thread.currentThread().getName(), taskName.substring(0, 15),
@@ -284,6 +289,7 @@ public class OmniCreditBasedSequenceNumberingViewReader
      *
      * @return ResultSubpartitionView.AvailabilityWithBacklog
      */
+    @Override
     public ResultSubpartitionView.AvailabilityWithBacklog getAvailabilityAndBacklog() {
         if (nativeCreditBasedSequenceNumberingViewReaderRef == -1) {
             return new ResultSubpartitionView.AvailabilityWithBacklog(false, 0);
@@ -301,7 +307,6 @@ public class OmniCreditBasedSequenceNumberingViewReader
         }
         return new ResultSubpartitionView.AvailabilityWithBacklog(isAvailable, backlog);
     }
-
 
     static class BufferInfo {
         private NetworkBuffer networkBuffer;
@@ -337,6 +342,10 @@ public class OmniCreditBasedSequenceNumberingViewReader
                 return bufferAndAvailability;
             } else {
                 // get next buffer from c++
+                // The native code will put the data in the serializedBatchQueue to the heap-off memory.
+                // The java code can directly decode the data from the heap-off memory,
+                // and save to the bufferInfos.
+                // "readElementNum" is the size of serializedBatchQueue in the native code (the max value is 10)
                 int readElementNum = getNextBuffer(nativeCreditBasedSequenceNumberingViewReaderRef);
                 if (readElementNum > 0) {
                     // decode the buffer
@@ -352,10 +361,12 @@ public class OmniCreditBasedSequenceNumberingViewReader
     }
 
     private InputChannel.BufferAndAvailability doGetNextBuffer() throws IOException {
-        if (bufferInfos.size() > 0) {
+        if (!bufferInfos.isEmpty()) {
             flushed = false;
-            numCreditsAvailable--;
             BufferInfo bufferInfo = bufferInfos.remove(0);
+            if (bufferInfo.networkBuffer.isBuffer() && --numCreditsAvailable < 0) {
+                throw new IllegalStateException("no credit available");
+            }
             Buffer.DataType nextDataType = bufferInfos.size() > 0 ? Buffer.DataType.DATA_BUFFER : Buffer.DataType.NONE;
 
             return new InputChannel.BufferAndAvailability(
@@ -381,7 +392,7 @@ public class OmniCreditBasedSequenceNumberingViewReader
                 doDecodeVectorBatchBuffer(address, length);
             } else if (memoryType == 1 || memoryType == 2) {
                 // memorySegment
-                doDecodeMemorySegmentBuffer(address, length,memoryType);
+                doDecodeMemorySegmentBuffer(address, length, memoryType);
             } else {
                 LOG.error("Unknown memory type: {} for task: {} ## {}", memoryType,
                         taskName.substring(0, 15), subPartitionIndex);
@@ -467,7 +478,8 @@ public class OmniCreditBasedSequenceNumberingViewReader
     public void stop() {
         running = false;
         int res = checkIfDataAvailableAndNotifyNetty();
-        while (res > 0) {
+        int retryCount = 0;
+        while (res > 0 && retryCount++ < 5) {
             LOG.info("OmniCreditBasedSequenceNumberingViewReader of {}## "
                             + "{}............................find data during stop......data size= "
                             + "{}................................",
@@ -479,6 +491,11 @@ public class OmniCreditBasedSequenceNumberingViewReader
                 throw new RuntimeException(e);
             }
             res = checkIfDataAvailableAndNotifyNetty();
+        }
+
+        if (res > 0) {
+            LOG.warn("There are still {} data available after stop, taskName: {}, partitionId: {}, subPartitionIndex: {}",
+                    res, taskName.substring(0, 15), partitionId, subPartitionIndex);
         }
 
         NativeBufferRecycler.unRegisterInstance(nativeCreditBasedSequenceNumberingViewReaderRef);
@@ -516,14 +533,20 @@ public class OmniCreditBasedSequenceNumberingViewReader
     /**
      * resumeConsumption
      */
+    @Override
     public void resumeConsumption() {
         if (initialCredit == 0) {
             // reset available credit if no exclusive buffer is available at the
             // consumer side for all floating buffers must have been released
             numCreditsAvailable = 0;
         }
+
+        LOG.info("resumeConsumption and notify data available, taskName: {}, partitionId: {}, subPartitionIndex: {}",
+                taskName.substring(0, 15), partitionId, subPartitionIndex);
         resumeConsumption(nativeCreditBasedSequenceNumberingViewReaderRef);
-        super.resumeConsumption();
+
+        // When subPartition is blocked, the flusher thread may not notify data available, so we need to notify it manually.
+        firstDataAvailableNotification(nativeCreditBasedSequenceNumberingViewReaderRef);
     }
 
     /**
@@ -531,6 +554,7 @@ public class OmniCreditBasedSequenceNumberingViewReader
      *
      * @return boolean
      */
+    @Override
     public boolean needAnnounceBacklog() {
         return initialCredit == 0 && numCreditsAvailable == 0;
     }
@@ -540,6 +564,7 @@ public class OmniCreditBasedSequenceNumberingViewReader
      *
      * @param creditDeltas creditDeltas
      */
+    @Override
     public void addCredit(int creditDeltas) {
         LOG.info("got a credit from client for task: {} ## {}, credit = {} , addedCredit = {}",
                 taskName.substring(0, 15),
@@ -550,6 +575,7 @@ public class OmniCreditBasedSequenceNumberingViewReader
         numCreditsAvailable += creditDeltas;
     }
 
+    @Override
     int getNumCreditsAvailable() {
         return numCreditsAvailable;
     }

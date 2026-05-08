@@ -55,7 +55,7 @@ std::string RocksDBSnapshotStrategyBase::getDescription() const
 }
 
 
-SnapshotResources *RocksDBSnapshotStrategyBase::syncPrepareResources(long checkpointId)
+std::shared_ptr<SnapshotResources> RocksDBSnapshotStrategyBase::syncPrepareResources(long checkpointId)
 {
     auto snapshotDirectory = prepareLocalSnapshotDirectory(checkpointId);
 
@@ -65,7 +65,7 @@ SnapshotResources *RocksDBSnapshotStrategyBase::syncPrepareResources(long checkp
     auto previousSnapshot = snapshotMetaData(checkpointId, stateMetaInfoSnapshots);
     takeDBNativeCheckpoint(snapshotDirectory);
 
-    return new NativeRocksDBSnapshotResources(
+    return std::make_shared<NativeRocksDBSnapshotResources>(
             snapshotDirectory,
             previousSnapshot,
             stateMetaInfoSnapshots);
@@ -206,11 +206,13 @@ RocksDBSnapshotStrategyBase::RocksDBSnapshotOperation::RocksDBSnapshotOperation(
     long checkpointId,
     CheckpointStreamFactory* checkpointStreamFactory,
     std::shared_ptr<SnapshotDirectory> localBackupDirectory,
-    std::vector<std::shared_ptr<StateMetaInfoSnapshot>> stateMetaInfoSnapshots)
+    std::vector<std::shared_ptr<StateMetaInfoSnapshot>> stateMetaInfoSnapshots,
+    std::shared_ptr<TypeSerializer> keySerializer)
     : checkpointId(checkpointId),
     checkpointStreamFactory(checkpointStreamFactory),
     stateMetaInfoSnapshots(std::move(stateMetaInfoSnapshots)),
-    localBackupDirectory(std::move(localBackupDirectory))
+    localBackupDirectory(std::move(localBackupDirectory)),
+    keySerializer(keySerializer)
 {
     tmpResourcesRegistry = std::make_shared<CloseableRegistry>();
 }
@@ -234,7 +236,7 @@ std::shared_ptr<KeyedStateHandle> RocksDBSnapshotStrategyBase::RocksDBSnapshotOp
     return nullptr;
 }
 
-SnapshotResult<KeyedStateHandle> *RocksDBSnapshotStrategyBase::RocksDBSnapshotOperation::get(
+std::shared_ptr<SnapshotResult<KeyedStateHandle>> RocksDBSnapshotStrategyBase::RocksDBSnapshotOperation::get(
     std::shared_ptr<omnistream::OmniTaskBridge> bridge)
 {
     return nullptr;

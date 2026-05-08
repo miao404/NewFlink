@@ -13,11 +13,15 @@
 #include <util/omni_exception.h>
 #include <utils/exception/Throwable.h>
 #include <vector>
+#include <cstdint>
 #include <jni.h>
 #include "state/metainfo/StateMetaInfoSnapshot.h"
 #include "runtime/state/SnapshotResult.h"
 #include "runtime/state/StreamStateHandle.h"
+#include "runtime/state/restore/KeyGroupEntry.h"
+#include "runtime/checkpoint/CheckpointOptions.h"
 #include "core/fs/Path.h"
+#include "state/LocalRecoveryConfig.h"
 
 namespace omnistream {
     class OmniTaskBridge {
@@ -28,14 +32,41 @@ namespace omnistream {
 
         virtual std::shared_ptr<SnapshotResult<StreamStateHandle>> CallMaterializeMetaData(
                 jlong checkpointId,
-                std::vector<std::shared_ptr<StateMetaInfoSnapshot>>& snapshots) = 0;
-        
+                std::vector<std::shared_ptr<StateMetaInfoSnapshot>>& snapshots,
+                std::shared_ptr<LocalRecoveryConfig> localRecoveryConfig, CheckpointOptions *checkpointOptions,
+                std::string keySerializer) = 0;
+
+
         virtual jobject CallUploadFilesToCheckpointFs(const std::vector<Path>& filePaths,
                                                       int numberOfSnapshottingThreads) = 0;
 
         virtual std::vector<StateMetaInfoSnapshot> readMetaData(const std::string &metaStateHandle) = 0;
 
+        virtual jobject AcquireSavepointOutputStream(long checkpointId, CheckpointOptions *checkpointOptions) = 0;
+
+        virtual std::shared_ptr<SnapshotResult<StreamStateHandle>> CloseSavepointOutputStream(jobject provider) = 0;
+
+        virtual void WriteSavepointOutputStream(jobject provider, const int8_t *chunk, size_t offset, size_t len) = 0;
+
+        virtual void WriteSavepointMetadata(jobject provider, const std::vector<std::shared_ptr<StateMetaInfoSnapshot>>& snapshots,
+                                            std::string keySerializer) = 0;
+
+        virtual long GetSavepointOutputStreamPos(jobject provider) = 0;
+
+        virtual void getKeyGroupEntries(jobject inputStream,
+            int &currentKvStateId, bool isUsingKeyGroupCompression, std::vector<KeyGroupEntry> &entries) = 0;
+
+        virtual jobject getSavepointInputStream(const std::string &metaStateHandle) = 0;
+
+        virtual void setSavepointInputStreamOffset(jobject inputStream, int64_t offset) = 0;
+
+        virtual bool isUsingKeyGroupCompression(jobject inputStream) = 0;
+
+        virtual void closeSavepointInputStream(jobject inputStream) = 0;
+
         virtual JNIEnv* getJNIEnv() = 0;
+
+        virtual bool CallDownloadFileToLocal(const StreamStateHandle &cppHandle, const std::string &restoreInstancePath) = 0;
     };
 }
 

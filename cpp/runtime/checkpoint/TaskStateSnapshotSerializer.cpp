@@ -134,7 +134,7 @@ nlohmann::json TaskStateSnapshotSerializer::parseIncrementalKeyedStateHandle(
     nlohmann::json handleJson;
     // IncrementalLocalKeyedStateHandle 需要 directoryStateHandle
     handleJson["@class"] = "org.apache.flink.runtime.state.IncrementalLocalKeyedStateHandle";
-    handleJson["directoryStateHandle"] = parseDirectoryStateHandle(kh->getDirectoryStateHandle());
+    handleJson["directoryStateHandle"] = parseDirectoryStateHandle(kh->GetDirectoryStateHandle());
     handleJson["keyGroupRange"] = parseKeyGroupRange(kh->GetKeyGroupRange());
     handleJson["stateHandleId"] = parseStateHandleId(kh->GetStateHandleId());
     handleJson["checkpointId"] = kh->GetCheckpointId();
@@ -163,6 +163,16 @@ nlohmann::json TaskStateSnapshotSerializer::parseIncrementalRemoteKeyedStateHand
     return handleJson;
 }
 
+nlohmann::json TaskStateSnapshotSerializer::parseKeyGroupsStateHandle(std::shared_ptr<KeyGroupsStateHandle> kh)
+{
+    nlohmann::json handleJson;
+    handleJson["@class"] = "org.apache.flink.runtime.state.KeyGroupsStateHandle";
+    handleJson["keyGroupRange"] = parseKeyGroupRange(kh->GetKeyGroupRange());
+    handleJson["metaDataState"] = parseMetaDataState(kh->getDelegateStateHandle());
+    handleJson["stateHandleId"] = parseStateHandleId(kh->GetStateHandleId());
+    return handleJson;
+}
+
 nlohmann::json TaskStateSnapshotSerializer::parseMetaDataState(std::shared_ptr<StreamStateHandle> metaDataStateHandle)
 {
     nlohmann::json metaDataStateHandleJson;
@@ -185,6 +195,13 @@ nlohmann::json TaskStateSnapshotSerializer::parseMetaDataState(std::shared_ptr<S
         metaDataStateHandleJson["data"] = jobj["data"];
         metaDataStateHandleJson["stateSize"] = msh->GetStateSize();
         metaDataStateHandleJson["streamStateHandleID"] = parseStreamStateHandleID(msh->GetStreamStateHandleID());
+    } else if(auto msh = std::dynamic_pointer_cast<PlaceholderStreamStateHandle>(metaDataStateHandle)){
+        metaDataStateHandleJson["@class"] = "org.apache.flink.runtime.state.PlaceholderStreamStateHandle";
+        metaDataStateHandleJson["stateSize"] = msh->GetStateSize();
+        nlohmann::json physicalStateHandleIDJson;
+        physicalStateHandleIDJson["@class"] = "org.apache.flink.runtime.state.PhysicalStateHandleID";
+        physicalStateHandleIDJson["keyString"] = msh->GetStreamStateHandleIDKeyString();
+        metaDataStateHandleJson["physicalID"] = physicalStateHandleIDJson;
     } else {
         throw std::runtime_error("Unknown metaDataStateHandle class.");
     }
@@ -256,7 +273,7 @@ nlohmann::json TaskStateSnapshotSerializer::parseSharedState(
 }
 
 nlohmann::json TaskStateSnapshotSerializer::parseInflightDataRescalingDescriptor(
-    const InflightDataRescalingDescriptor& rescalingDescriptor)
+    const std::shared_ptr<InflightDataRescalingDescriptor> rescalingDescriptor)
 {
     // TTODO: Now we assume it is empty
     nlohmann::json inputRescalingDesc;

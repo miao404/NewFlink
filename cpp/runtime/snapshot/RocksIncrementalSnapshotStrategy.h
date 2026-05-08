@@ -48,17 +48,18 @@ public:
         long lastCompletedCheckpointId
     );
 
-    SnapshotResources *syncPrepareResources(long checkpointId)
+    std::shared_ptr<SnapshotResources> syncPrepareResources(long checkpointId)
     {
         return RocksDBSnapshotStrategyBase::syncPrepareResources(checkpointId);
     };
 
     std::shared_ptr<SnapshotResultSupplier<KeyedStateHandle>> asyncSnapshot(
-        SnapshotResources* snapshotResources,
+        const std::shared_ptr<SnapshotResources>& snapshotResources,
         long checkpointId,
         long timestamp,
         CheckpointStreamFactory* checkpointStreamFactory,
-        CheckpointOptions* checkpointOptions) override;
+        CheckpointOptions* checkpointOptions,
+        std::string keySerializer = "") override;
 
     void notifyCheckpointComplete(long completedCheckpointId);
     void notifyCheckpointAborted(long abortedCheckpointId);
@@ -78,9 +79,11 @@ protected:
             std::shared_ptr<SnapshotDirectory> localBackupDirectory,
             std::shared_ptr<PreviousSnapshot> previousSnapshot,
             SnapshotType::SharingFilesStrategy sharingFilesStrategy,
-            std::vector<std::shared_ptr<StateMetaInfoSnapshot>>& stateMetaInfoSnapshots);
+            std::vector<std::shared_ptr<StateMetaInfoSnapshot>>& stateMetaInfoSnapshots,
+            CheckpointOptions *checkpointOptions,
+            std::shared_ptr<TypeSerializer> keySerializer);
 
-        SnapshotResult<KeyedStateHandle> *get(std::shared_ptr<omnistream::OmniTaskBridge> bridge) override;
+        std::shared_ptr<SnapshotResult<KeyedStateHandle>> get(std::shared_ptr<omnistream::OmniTaskBridge> bridge) override;
 
     private:
         long uploadSnapshotFiles(
@@ -97,6 +100,7 @@ protected:
         RocksIncrementalSnapshotStrategy* parent_;
         std::shared_ptr<PreviousSnapshot> previousSnapshot_;
         SnapshotType::SharingFilesStrategy sharingFilesStrategy_;
+        CheckpointOptions *checkpointOptions_;
     };
 
 private:

@@ -364,8 +364,8 @@ TEST(RocksDBTest, TimeWindowTypeTest) {
 
     DataInputDeserializer serializedData(reinterpret_cast<const uint8_t *>(valueInTable.data()), valueInTable.length(), 0);
     TimeWindow* resPtr = reinterpret_cast<TimeWindow*>(vSerializer->deserialize(serializedData));
-    ASSERT_EQ(1000, resPtr->start);
-    ASSERT_EQ(2000, resPtr->end);
+    ASSERT_EQ(1000, resPtr->getStart());
+    ASSERT_EQ(2000, resPtr->getEnd());
     rocksDb->Close();
 }
 
@@ -523,7 +523,6 @@ TEST(RocksDBTest, ValueStateTest) {
     BinaryRowData* keyRowData = BinaryRowData::createBinaryRowDataWithMem(1);
     keyRowData->setLong(0, 100);
     context->setCurrentKey(keyRowData);
-    context->setCurrentKeyGroupIndex(1);
     // Initialize RegisteredKeyValueStateBackendMetaInfo
     auto metaInfo = std::make_unique<RegisteredKeyValueStateBackendMetaInfo>("metaInfo",
                                          voidNamespaceSerializer, binaryRowDataSerializer);

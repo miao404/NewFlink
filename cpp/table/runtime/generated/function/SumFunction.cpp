@@ -104,9 +104,6 @@ void SumFunction::accumulate(omnistream::VectorBatch *input, const std::vector<i
                 sum = fieldValue;
                 sumIsNull = false;
             } else {
-                if (sum > std::numeric_limits<long>::max() - fieldValue) {
-                    throw std::invalid_argument("SumFunction Overflow detected!");
-                }
                 sum += fieldValue;
             }
         }
@@ -265,7 +262,7 @@ bool SumFunction::equaliser(BinaryRowData *r1, BinaryRowData *r2)
 void SumFunction::setRetraction(int accIndexCount0Index)
 {
     this->accIndexCount0 = accIndexCount0Index;
-    if (accIndexCount0Index > 0) {
+    if (accIndexCount0Index >= 0) {
         consumeRetraction = true;
     }
 }
